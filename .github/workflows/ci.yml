@@ -55,6 +55,21 @@ jobs:
       - name: Run tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+  # 现有 CI 没有 Windows 侧 clippy：Windows-only 代码（SAPI、JobObject）和
+  # examples（含 speech_probe）都不会被 Linux clippy 看到。`--all-targets` 会把
+  # examples 也编进来，防止示例在 Windows 上烂掉。
+  clippy-windows:
+    name: Rust (clippy Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Lint
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
   clippy:
     name: Rust (clippy, -D warnings)
     runs-on: ubuntu-latest
