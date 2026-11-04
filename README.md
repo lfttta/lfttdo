@@ -11,6 +11,7 @@ Windows 桌面 AI 助理：聊天、看图、联网抓取、MCP 工具调用，�
 
 - **聊天**：流式输出、多会话、长对话自动摘要压缩、上下文预算可调。
 - **看图**：粘贴 / 拖拽 / 选文件三种入口，统一走同一条图片归一化（缩放、转码、体积闸门）；视觉模型可描述图片。
+- **语音输入**：输入框旁的麦克风按钮，ONNX Runtime 静态链入的离线引擎（自研前处理/解码）+ SenseVoice 模型，自动识别中文/英文/日文/韩文/粤语，文字插入光标处并自动发送；支持 120 秒自动停止、Esc 取消。模型不随包，首次使用在设置页下载约 228MB，之后完全离线；不上传音频，应用不保存音频。
 - **联网抓取**：内置 `fetch_url`，按内容抽取正文；每跳重定向都过 SSRF 判定（拒绝非 http(s)、本机、内网与元数据地址）。
 - **本地文件**：设置页「文件访问」列出的目录作为**只读**范围；生成/修改文件写到当前输出目录（工作文件夹或默认储存位置），写入走权限弹窗、可放行本会话。路径逐次校验（绝对路径、junction/越界一律拒绝），非 UTF-8 文件明确拒绝而不是静默转码。
 - **命令执行**：内置 `run_command`，命令交给选定的 shell 后端执行。shell 可选：设置页「Shell」区块内置 8 个预设 profile（bash、sh、zsh、fish、git-bash、pwsh、powershell、cmd），也支持自定义 profile（任意可执行文件路径，可校验「程序存在且可执行」）；默认 shell 存在设置里，单次调用还可临时指定；每次调用都弹 Exec 确认。
@@ -51,12 +52,36 @@ npm run tauri build        # 打包（NSIS 安装器）
 - 模型名：你已下载的模型
 - 云端端点需要填自己的 API Key（存入 Windows 凭据管理器，不写配置文件）
 
+## 语音输入
+
+使用的是**ONNX Runtime 静态链入的离线引擎（自研前处理/解码）+ SenseVoice 模型**，
+模型不随包、首次使用时下载（见下），不依赖任何 Windows 可选组件
+（无需安装系统语音包），识别在本机完成，不上传音频；应用也不把音频写入磁盘，
+识别完成后只保留文字。语言自动判定：中文、英文、日文、韩文、粤语，无需手动选择。
+
+**首次使用需下载模型**：打开「设置 → 语音输入」，点「下载模型」（约 228MB，
+建议在网络通畅时进行）；面板显示下载进度，可随时取消，失败后可重试。
+下载完成后状态变为「已就绪」，此后语音输入完全离线。模型未下载时点麦克风，
+输入框上方会显示提示原文。
+
+**麦克风权限**：打开「设置 → 隐私和安全性 → 麦克风」，确认「让桌面应用访问你的麦克风」已开启。
+权限被系统拒绝时，识别错误会原文显示在输入框上方。
+
+**质量提示**：SenseVoice 的中文准确率好于旧的 Windows 系统识别，但标点、断句仍弱于
+云端大模型，适合短句口述；长段落建议说完整理后再发送。
+
+**模型署名与许可**：模型为 SenseVoice（FunAudioLLM/SenseVoiceSmall，经 sherpa-onnx 导出），
+来源见 <https://github.com/FunAudioLLM/SenseVoice>。模型权重采用
+**FunASR Model Open Source License v1.1**（不是 Apache-2.0），商用分发要求署名并保留模型名称，
+许可全文见 <https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE>。
+
 ## 数据位置
 
 常规安装的数据都在 `%APPDATA%\com.qwa.do\`：
 
 - `settings.json`：模型地址与模型名、上下文预算、主题、长期记忆开关、`system_prompt`（人设）、自定义 shell profile 与默认 shell
 - `qwen-do.db`：会话、消息与长期记忆
+- `models/`：语音识别模型（首次使用时下载，约 228MB；SenseVoice 权重，署名与许可见「语音输入」段）
 - `skills/`：技能包；`skills.json` 记录每个技能的启停
 - `mcp.json`：MCP 服务器配置（可选）；`mcp_trust.json` 记录每台服务器的信任档
 - `window.json`、`qwen-do.log`：窗口位置与日志
@@ -104,7 +129,7 @@ Rust 侧需 MSVC 工具链：默认工具链不是 MSVC 的机器，用 `rustup 
 字符的仓库路径下链接器会崩）。仓库路径含非 ASCII 字符时，aws-lc-sys 的 NASM 构建步骤也会失败，
 可设 `AWS_LC_SYS_PREBUILT_NASM=1` 改用预编译汇编，或把仓库放到纯 ASCII 路径。
 
-当前读数：Rust 797 passed / 1 ignored + 集成 3 passed；前端 294 passed；clippy 无新增
+当前读数：Rust 831 passed / 3 ignored + 集成 3 passed；前端 319 passed；clippy 无新增
 （Windows 目标也已是 `-D warnings` 门禁）。
 
 ## 目录结构

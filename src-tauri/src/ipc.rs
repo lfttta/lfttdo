@@ -295,6 +295,19 @@ pub struct AppState {
     /// 留在某一轮的 `ToolCtx` 里）；`send_message` 每轮开头现刷（spec §2「生效时机」：
     /// 改设置下一条消息生效，无缓存可过期）。锁走 `crate::lock` 的中毒容忍入口。
     pub shells: Arc<RwLock<ShellCatalog>>,
+    /// Phase 1：正在进行的那次语音输入。槽位空 = 没在录音；take 出来之后命令层
+    /// 用 `blocking()` 等它收尾。与 `cancel`/`running` 同一种「一次性槽位」。
+    pub voice: Arc<Mutex<Option<crate::voice::VoiceSession>>>,
+    /// 语音模型下载槽位（status + 取消令牌）。与 `voice` 分开：下载与录音互不占用。
+    pub voice_model: Arc<Mutex<VoiceModelState>>,
+}
+
+/// 语音模型下载的共享状态。`status` 是最近一次经 `"voice-model"` 通道发布的状态；
+/// `cancel` 是正在进行的下载令牌（None = 没在下载）。令牌留在槽里直到下载任务
+/// 收尾清理完 `.part` 才摘掉 —— 否则「取消后立刻重下」会让两个任务写同一批临时文件。
+pub struct VoiceModelState {
+    pub status: crate::voice::VoiceModelStatus,
+    pub cancel: Option<CancellationToken>,
 }
 
 /// 单轮并发闸门。guard 一析构就释放槽位，所以 `?` 的每条早退路径（读设置失败、
@@ -2557,6 +2570,138 @@ pub async fn settings_set_api_key(
     blocking(move || store.set_api_key(&api_key).map_err(|e| e.to_string())).await
 }
 
+// ───────────────────── 语音输入：纯 Rust 离线引擎（ort + SenseVoice） ─────────────────────
+
+/// 模型状态事件通道（契约 `VOICE_MODEL_CHANNEL`）。`app.emit` 只在本文件出现。
+const VOICE_MODEL_CHANNEL: &str = "voice-model";
+
+/// 开始一次录音。已有会话时返回「正在录音」——前端据此恢复按钮状态。
+/// 命令层只做薄装配：查模型就绪、调 `voice::start`、把会话放进槽位。
+/// 语言不再可选：SenseVoice 自动识别中/英/日/韩/粤。
+#[tauri::command]
+pub async fn voice_start(state: State<'_, AppState>) -> Result<(), String> {
+    if guard(&state.voice).is_some() {
+        return Err("正在录音，请先停止或取消当前录音。".into());
+    }
+
+    let dir = crate::voice::download::model_dir(&state.data_dir);
+    let check = dir.clone();
+    let status = blocking(move || Ok(crate::voice::download::status_of(&check))).await?;
+    if status.state != "ready" {
+        return Err("语音模型尚未下载，请先在 设置 → 语音输入 中下载。".into());
+    }
+    let session = blocking(move || crate::voice::start(&dir)).await?;
+
+    // 启动是异步的（专用线程 + 10 秒初始化窗口），两次 start 可能同时走到这里。
+    // 第二次进来时把刚建好的会话丢掉 —— 它的 Drop 会发送 Cancel，不会泄漏麦克风。
+    let mut slot = guard(&state.voice);
+    if slot.is_some() {
+        drop(slot);
+        return Err("正在录音，请先停止或取消当前录音。".into());
+    }
+    *slot = Some(session);
+    Ok(())
+}
+
+/// 停止录音并返回最终文本（trim 后）。允许空串：用户没说话不是错误。
+#[tauri::command]
+pub async fn voice_stop(state: State<'_, AppState>) -> Result<String, String> {
+    let session = guard(&state.voice).take();
+    let Some(session) = session else {
+        return Err("当前没有正在进行的录音。".into());
+    };
+    // `stop` 要加载模型并跑一次离线识别（秒级）并 join 专用线程，不能占住 tokio worker。
+    blocking(move || session.stop()).await
+}
+
+/// 取消录音并丢弃已识别的文本。没有会话时幂等成功（前端 Esc 可能多按）。
+#[tauri::command]
+pub async fn voice_cancel(state: State<'_, AppState>) -> Result<(), String> {
+    let session = guard(&state.voice).take();
+    let Some(session) = session else {
+        return Ok(());
+    };
+    blocking(move || session.cancel()).await
+}
+
+/// 模型状态。没在下载时以磁盘为准（用户可能手删了文件）；下载中用最近发布的缓存。
+#[tauri::command]
+pub async fn voice_model_status(
+    state: State<'_, AppState>,
+) -> Result<crate::voice::VoiceModelStatus, String> {
+    let slot = state.voice_model.clone();
+    let dir = crate::voice::download::model_dir(&state.data_dir);
+    blocking(move || {
+        let mut m = guard(&slot);
+        if m.cancel.is_none() {
+            m.status = crate::voice::download::status_of(&dir);
+        }
+        Ok(m.status.clone())
+    })
+    .await
+}
+
+/// 启动模型下载并立即返回。已在下载或已就绪时返回 Err（契约）。
+/// 进度与终态经 `"voice-model"` 通道发布；下载任务独占槽位直到 `.part` 清理完。
+#[tauri::command]
+pub async fn voice_model_download(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let token = CancellationToken::new();
+    let transport = crate::voice::download::ReqwestModelTransport::new(token.clone())?;
+    let dir = crate::voice::download::model_dir(&state.data_dir);
+    let slot = state.voice_model.clone();
+    let check_dir = dir.clone();
+    let check_slot = slot.clone();
+    let check_token = token.clone();
+    blocking(move || {
+        let mut m = guard(&check_slot);
+        if m.cancel.is_some() {
+            return Err("语音模型正在下载，请等待完成或先取消。".into());
+        }
+        let status = crate::voice::download::status_of(&check_dir);
+        if status.state == "ready" {
+            m.status = status;
+            return Err("语音模型已下载，无需重复下载。".into());
+        }
+        m.cancel = Some(check_token);
+        m.status = crate::voice::VoiceModelStatus {
+            state: "downloading".into(),
+            percent: 0,
+            message: String::new(),
+        };
+        Ok(())
+    })
+    .await?;
+
+    // 发布闭包：更新缓存 + 发事件。voice 模块不 `use tauri`，tauri 出口只在这里。
+    let slot_done = slot.clone();
+    let publish = move |status: crate::voice::VoiceModelStatus| {
+        guard(&slot).status = status.clone();
+        if let Err(e) = app.emit(VOICE_MODEL_CHANNEL, status) {
+            tracing::warn!("voice-model 事件发送失败：{e}");
+        }
+    };
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::voice::download::download_model(&dir, &transport, &token, &publish).await;
+        // 终态已由 download_model 发布；这里只摘令牌，放行下一次下载。
+        // publish 闭包捕获了 slot 的另一个 Arc，本任务结束前它一直活着。
+        drop(publish);
+        guard(&slot_done).cancel = None;
+    });
+    Ok(())
+}
+
+/// 取消模型下载。幂等：没在下载时也是成功。清理 `.part` 与回 missing 由下载任务收尾。
+#[tauri::command]
+pub async fn voice_model_cancel_download(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(token) = guard(&state.voice_model).cancel.as_ref() {
+        token.cancel();
+    }
+    Ok(())
+}
+
 // ───────────────────── Agent Shell：预设表与 profile 校验（spec §5.5） ─────────────────────
 
 /// 检测到的预设表（spec §5.5 `shellPresets()`；2026-11-01 修订：候选 + 检测）。
@@ -3087,6 +3232,13 @@ pub fn run() {
                 data_dir: dir.clone(),
                 extracting: ExtractLocks::default(),
                 shells,
+                voice: Arc::new(Mutex::new(None)),
+                voice_model: Arc::new(Mutex::new(VoiceModelState {
+                    status: crate::voice::download::status_of(&crate::voice::download::model_dir(
+                        &dir,
+                    )),
+                    cancel: None,
+                })),
             });
             // 后台自举：句柄从刚装好的 State 里取（保持装配行仍是唯一一条
             // `registry: build_production_registry()` —— 那条守卫测试盯着它）。
@@ -3194,6 +3346,12 @@ pub fn run() {
             skills_list,
             skills_open_folder,
             skills_set_enabled,
+            voice_start,
+            voice_stop,
+            voice_cancel,
+            voice_model_status,
+            voice_model_download,
+            voice_model_cancel_download,
         ])
         // R108 / T18 m2 —— `capabilities/default.json` 的 `"windows": ["main"]` 按
         // **label** 指名窗口。主窗口现在在 `setup` 里由 `WebviewWindowBuilder` 创建
@@ -7852,6 +8010,36 @@ mod tests {
             .filter(|name| !name.is_empty())
             .collect();
         for cmd in ["shell_presets", "shell_profile_validate"] {
+            assert!(
+                registered.contains(&cmd),
+                "命令 {cmd} 写了但没登记，前端调用只会拿到 not found:{registered:?}"
+            );
+        }
+    }
+
+    /// Phase 1 语音命令与上面同一个坑（`generate_handler!` 是宏）：漏登记不编译报错，
+    /// 只会在运行时让前端拿到 not found。机制照抄 shell 那条守卫。
+    #[test]
+    fn the_voice_commands_are_registered_in_the_handler_list() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ipc.rs"));
+        let list = src
+            .split("tauri::generate_handler![")
+            .nth(1)
+            .and_then(|rest| rest.split("]").next())
+            .expect("找不到 generate_handler 的登记表");
+        let registered: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
+        for cmd in [
+            "voice_start",
+            "voice_stop",
+            "voice_cancel",
+            "voice_model_status",
+            "voice_model_download",
+            "voice_model_cancel_download",
+        ] {
             assert!(
                 registered.contains(&cmd),
                 "命令 {cmd} 写了但没登记，前端调用只会拿到 not found:{registered:?}"

@@ -2,13 +2,14 @@ import { StrictMode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "./App";
-import type { AgentEvent, SessionRow, SettingsView } from "./types";
+import type { AgentEvent, SessionRow, SettingsView, VoiceModelStatus } from "./types";
 
 // 命令层整体换掉：这一份测试要钉的是 **App 的义务**（按 sessionId 过滤、respond 返回 false
 // 时不许动卡片、设置驱动 applyTheme、切会话先 interrupt 再 replay），
 // 线格式那一半归 `ipc/commands.test.ts`。
 const h = vi.hoisted(() => {
   const listeners: ((sessionId: string, e: AgentEvent) => void)[] = [];
+  const voiceModelListeners: ((s: VoiceModelStatus) => void)[] = [];
   return {
     sendMessage: vi.fn(),
     respond: vi.fn(),
@@ -46,6 +47,23 @@ const h = vi.hoisted(() => {
     // 把真正的失败淹掉。预设给空表 —— 本文件的用例不关心 Shell 区。
     shellPresets: vi.fn(async () => []),
     shellProfileValidate: vi.fn(async () => {}),
+    // 语音模型子区（SettingsPanel 的生产默认回调直连这几支）：与 shellPresets 同一条理由，
+    // 缺了它们面板一挂载就在默认参数求值时抛「No "voiceModelStatus" export is defined
+    // on the mock」。状态给「未下载」—— 本文件的用例不关心模型区。
+    voiceModelStatus: vi.fn(async () => ({ state: "missing", percent: 0, message: "" })),
+    voiceModelDownload: vi.fn(async () => {}),
+    voiceModelCancelDownload: vi.fn(async () => {}),
+    subscribeVoiceModel: (cb: (s: VoiceModelStatus) => void) => {
+      voiceModelListeners.push(cb);
+      return () => {
+        const i = voiceModelListeners.indexOf(cb);
+        if (i >= 0) voiceModelListeners.splice(i, 1);
+      };
+    },
+    voiceModelListeners,
+    emitVoiceModel: (s: VoiceModelStatus) => {
+      for (const l of [...voiceModelListeners]) l(s);
+    },
     subscribeAgent: (cb: (sessionId: string, e: AgentEvent) => void) => {
       listeners.push(cb);
       return () => {
@@ -156,7 +174,11 @@ beforeEach(() => {
   h.addMemory.mockReset().mockResolvedValue(1);
   h.shellPresets.mockReset().mockResolvedValue([]);
   h.shellProfileValidate.mockReset().mockResolvedValue(undefined);
+  h.voiceModelStatus.mockReset().mockResolvedValue({ state: "missing", percent: 0, message: "" });
+  h.voiceModelDownload.mockReset().mockResolvedValue(undefined);
+  h.voiceModelCancelDownload.mockReset().mockResolvedValue(undefined);
   h.listeners.length = 0;
+  h.voiceModelListeners.length = 0;
 });
 
 const settled = async () => {
