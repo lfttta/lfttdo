@@ -29,12 +29,12 @@ const MAX_MATCHES: usize = 200;
 const LINE_DISPLAY_CAP: usize = 500;
 /// 遍历深度与文件数上限：防符号链接环之外的失控树（幽灵目录、挂载点）。
 const MAX_DEPTH: usize = 32;
-const MAX_FILES: usize = 20_000;
+pub(crate) const MAX_FILES: usize = 20_000;
 /// 二进制嗅探窗口：前 8 KiB 含 NUL 即按二进制跳过（与 read_file 的判据同一形状）。
 const BINARY_SNIFF: usize = 8 * 1024;
-/// 跳过的目录名：纯构建产物/依赖树，搜索只会被它们淹没。glob 参数可显式点名例外吗？
+/// 跳过的目录名（grep 与 glob 共用）：纯构建产物/依赖树，搜索只会被它们淹没。glob 参数可显式点名例外吗？
 /// 不能 —— 这是硬规则，理由与「模型喊越界路径照样被闸门拒」相同：省一轮注定淹没的调用。
-const SKIPPED_DIRS: [&str; 3] = [".git", "node_modules", "target"];
+pub(crate) const SKIPPED_DIRS: [&str; 3] = [".git", "node_modules", "target"];
 
 pub struct GrepTool;
 
@@ -80,7 +80,7 @@ fn match_line(path: &Path, line_no: usize, line: &str) -> String {
 }
 
 /// 递归收集待搜文件。返回 (文件表, 被跳过的非文本文件数)。
-fn collect_files(root: &Path, files: &mut Vec<PathBuf>, skipped: &mut usize) {
+pub(crate) fn collect_files(root: &Path, files: &mut Vec<PathBuf>, skipped: &mut usize) {
     fn walk(dir: &Path, depth: usize, files: &mut Vec<PathBuf>, skipped: &mut usize) {
         if depth > MAX_DEPTH || files.len() >= MAX_FILES {
             return;
@@ -121,15 +121,8 @@ fn is_probably_text(path: &Path) -> Option<bool> {
     Some(!buf[..n].contains(&0))
 }
 
-/// 对单个文件跑正则，交出命中行（最多把 [`MAX_MATCHES`] 填满为止）。
+/// 对文件内容跑正则，交出命中行（最多把 [`MAX_MATCHES`] 填满为止）。
 /// 读取失败（非 UTF-8、权限等）由调用方计为「跳过」，不让整次搜索报错。
-fn search_file(path: &Path, re: &regex::Regex, out: &mut Vec<String>) {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return;
-    };
-    search_lines(path, &content, re, out);
-}
-
 fn search_lines(path: &Path, content: &str, re: &regex::Regex, out: &mut Vec<String>) {
     for (i, line) in content.lines().enumerate() {
         if out.len() >= MAX_MATCHES {
