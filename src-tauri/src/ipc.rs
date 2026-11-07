@@ -10,7 +10,7 @@ use crate::agent::memory::{
     MemoryCandidate, MemoryDecision, PROFILE_CHAR_CAP, consolidate_memory, extract_memories,
     merge_profile,
 };
-use crate::agent::session::{AgentSession, SessionDeps};
+use crate::agent::session::{AgentSession, SessionConfig, SessionDeps};
 use crate::agent::summarize::{SUMMARY_OMITTED, collect_summary, summary_note, summary_request};
 use crate::agent::types::{ContentBlock, Message, Role};
 use crate::mcp::bridge::{McpBridge, McpTool, ServerStatus};
@@ -25,9 +25,13 @@ use crate::store::db::{Db, SessionRow, events_from_messages};
 use crate::store::memory::{MemoryRow, MemoryWrite, RecallCfg};
 use crate::tools::edit_file::EditFileTool;
 use crate::tools::fetch::FetchTool;
+use crate::tools::glob::GlobTool;
+use crate::tools::grep::GrepTool;
 use crate::tools::memory_search::MemorySearchTool;
 use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::todo::TodoTool;
+use crate::tools::undo::UndoTool;
 use crate::tools::shell::{
     ShellCatalog, ShellProfile, ShellTool, detected_presets, ensure_executable, path_search_dirs,
     validate_custom,
@@ -390,6 +394,12 @@ pub struct TurnDeps {
     /// 由 `Settings::to_model_config()` 给（T39）：`None` = 请求体不带 `temperature`，
     /// 端点自己定。和 `context` 同样理由 —— 会话不许自己去读 `Settings`。
     pub temperature: Option<f32>,
+    /// G15：plan 模式开关（OpenCode 的「只读研究」agent）。由 `send_message` 从本轮
+    /// 那份 `Settings` 现取（context/temperature/memory 同一条线：会话不自己读
+    /// `Settings`），`run_turn` 经 `AgentSession::with_config` 注入 —— 改设置下一条
+    /// 消息生效。`true` 时 Write/Exec 级工具调用在会话循环里被拒（session.rs 的
+    /// `PLAN_MODE_NOTE`，不执行、不走权限门），Read 级照常。
+    pub plan_mode: bool,
     /// T5：记忆的四项开关（spec §7），由 `send_message` 从本轮那份 `Settings` 现取
     /// （context/temperature 同一条线：会话不自己读 `Settings`）。`enabled=false` 的
     /// 语义有两级：压缩段零抽取（记忆侧模型调用一个不发起）+ 请求头零备注（连召回
@@ -1287,6 +1297,7 @@ pub async fn run_turn(
         sink,
         context,
         temperature,
+        plan_mode,
         memory,
         embed,
         mut roots,
@@ -1454,7 +1465,14 @@ pub async fn run_turn(
     .with_roots(effective_roots(&roots))
     .with_output_dir(output_dir)
     .with_skills_dir(skills_dir)
-    .with_skills_disabled(skills_disabled);
+    .with_skills_disabled(skills_disabled)
+    // G15：plan 模式每轮现取（改设置下一条消息生效）—— 会话里 Write/Exec 级调用被拒、
+    // Read 照常，语义归 session.rs（`SessionConfig.plan_mode` / `PLAN_MODE_NOTE`）。
+    // `max_turns` 保持默认 25：它是防自我循环的保险丝而不是旋钮（spec 4.6），不进 Settings。
+    .with_config(SessionConfig {
+        plan_mode,
+        ..Default::default()
+    });
     session.defer_done();
     let session_cancel = session.cancel_handle();
     token.install(session_cancel.clone());
@@ -1609,6 +1627,24 @@ pub async fn send_message(
     // 每次执行看到的都是这份。这一行没法单测（`#[tauri::command]` 在单测里调不动），
     // 「值真的可解析」由 `shell_catalog_of` 的纯函数测试与 settings 侧 normalize 钉着。
     *crate::lock::write(&state.shells) = shell_catalog_of(&settings);
+    // G13：工具级权限规则（`settings.permission_rules` → gate）。生效时机与上面的 shell
+    // catalog、下面的 roots 同一条线 —— 每轮开头现读设置，**改完设置发下一条消息就生效**，
+    // 不做实时热更（轮内不变：正在跑的那一轮不换规则表）。
+    // `None`（没配过 / 已清空）时清空规则表，回到默认路径；形状非法时
+    // `set_rules_from_json` 报 Err，这里降级为 warn + 清空 —— fail-safe：规则缺失只会
+    // 回到「按默认问人」，绝不静默沿用上一轮的旧规则，也绝不让一条配错的规则拦停整条消息。
+    // 这一段没法单测（`#[tauri::command]` 在单测里调不动，同上面 shell catalog 那行）：
+    // 解析/替换/Err 语义由 `gate.rs` 的内联测试钉着，端到端行为由 `tests/gapcheck2.rs`
+    // 的 G13 验收测试钉着。
+    match &settings.permission_rules {
+        Some(v) => {
+            if let Err(reason) = state.gate.set_rules_from_json(v) {
+                tracing::warn!("permission_rules 形状非法，本轮忽略并清空规则：{reason}");
+                state.gate.rules().clear_tool_rules();
+            }
+        }
+        None => state.gate.rules().clear_tool_rules(),
+    }
     // R90：`normalize_base_url("")` 返回空串，settings.rs 不替用户编一个默认端点，
     // 所以这道守卫必须住在装配层 —— 空 base_url 到这里就停。
     if settings.base_url.trim().is_empty() {
@@ -1669,6 +1705,9 @@ pub async fn send_message(
             context: settings.to_context_config(),
             // T39：同上，温度的唯一来源是上面那个 `ModelConfig`（同一个 `normalize()` 出来的）。
             temperature,
+            // G15：plan 模式与上面各项同一条线 —— 同一份 `store.load()` 现取，改完设置
+            // 下一条消息生效（run_turn 经 `with_config` 注入会话；轮内不变）。
+            plan_mode: settings.plan_mode,
             extract_locks: state.extracting.clone(),
             // T26（R276）：roots 和上面两项同源 —— 同一个 `store.load()` 的每一轮现取，
             // 因此**用户改完设置发下一条消息就生效**，这里没有任何缓存可以过期。
@@ -2822,12 +2861,16 @@ pub fn build_production_registry(
 ) -> Arc<ToolRegistry> {
     let registry = Arc::new(ToolRegistry::new());
     registry.register(Arc::new(FetchTool::new()));
+    registry.register(Arc::new(GlobTool));
+    registry.register(Arc::new(GrepTool));
     registry.register(Arc::new(ReadFileTool));
     registry.register(Arc::new(UseSkillTool));
     registry.register(Arc::new(MemorySearchTool::new(db)));
     registry.register(Arc::new(WriteFileTool));
     registry.register(Arc::new(EditFileTool));
     registry.register(Arc::new(ShellTool::new(shells)));
+    registry.register(Arc::new(TodoTool));
+    registry.register(Arc::new(UndoTool));
     registry
 }
 
@@ -3438,6 +3481,8 @@ mod tests {
     use crate::permission::gate::PermissionGate;
     use crate::store::db::{Db, events_from_messages};
     use crate::tools::registry::ToolRegistry;
+use crate::tools::todo::TodoTool;
+use crate::tools::undo::UndoTool;
     use async_trait::async_trait;
     use futures::Stream;
     use tempfile::TempDir;
@@ -3515,6 +3560,7 @@ mod tests {
                     // （`run_turn` 侧的那条线由 `session.rs` 的
                     // `the_session_temperature_reaches_the_chat_request` 钉）。
                     temperature: None,
+                    plan_mode: false,
                     // 夹具默认不带 roots：除了那条专门量 roots 的测试（它自己搭 `TurnDeps`），
                     // T27（R286）之后这里还要多说一句：`build_production_registry()` 的表里
                     // **有** `read_file`，但空 roots 那一轮交给模型的声明表里没有它，
@@ -3893,6 +3939,7 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
                 roots: roots.clone(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
@@ -3968,6 +4015,7 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
                 roots: Vec::new(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
@@ -4001,7 +4049,7 @@ mod tests {
     /// `echo` / `guarded` 这类替身只该活在 `#[cfg(test)]` 里 —— 它们的名字一旦进生产，
     /// 请求体里就多出一条用户看不懂、实现也不是给用户的工具。
     #[test]
-    fn production_registry_ships_the_seven_builtin_tools() {
+    fn production_registry_ships_the_builtin_tools() {
         let (_dir, db) = (
             tempfile::tempdir().unwrap(),
             Arc::new(Db::open(&tempfile::tempdir().unwrap().path().join("r.db")).unwrap()),
@@ -4016,9 +4064,13 @@ mod tests {
             vec![
                 "edit_file",
                 "fetch_url",
+                "glob",
+                "grep",
                 "memory_search",
                 "read_file",
                 "run_command",
+                "todo_write",
+                "undo",
                 "use_skill",
                 "write_file",
             ],
@@ -4678,6 +4730,7 @@ mod tests {
                 sink: sink.clone(),
                 context: compacting_cfg(),
                 temperature: None,
+                plan_mode: false,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -4744,6 +4797,7 @@ mod tests {
                 sink: sink.clone(),
                 context: compacting_cfg(),
                 temperature: None,
+                plan_mode: false,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -5124,6 +5178,7 @@ mod tests {
                 sink: sink.clone(),
                 context: compacting_cfg(),
                 temperature: None,
+                plan_mode: false,
                 roots: Vec::new(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
@@ -5722,6 +5777,7 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -5899,6 +5955,7 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -5962,6 +6019,7 @@ mod tests {
                 sink: sink2.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6106,6 +6164,7 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6275,6 +6334,7 @@ mod tests {
                 sink: sink.clone(),
                 context: compacting_cfg(),
                 temperature: None,
+                plan_mode: false,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6415,6 +6475,7 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg {
                     enabled: false,
@@ -6471,6 +6532,7 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
                 roots: Vec::new(),
                 memory,
                 embed,
@@ -6805,6 +6867,7 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 extract_locks: ExtractLocks::default(),
@@ -7294,6 +7357,7 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
                 roots: Vec::new(),
                 memory,
                 embed: None,
@@ -8263,6 +8327,7 @@ mod tests {
                         ..Default::default()
                     },
                     temperature: None,
+                    plan_mode: false,
                     roots: Vec::new(),
                     skills_dir: None,
                     skills_disabled: Vec::new(),
