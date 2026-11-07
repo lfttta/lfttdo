@@ -31,6 +31,7 @@ use crate::tools::memory_search::MemorySearchTool;
 use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::todo::TodoTool;
+use crate::tools::undo::UndoTool;
 use crate::tools::shell::{
     ShellCatalog, ShellProfile, ShellTool, detected_presets, ensure_executable, path_search_dirs,
     validate_custom,
@@ -2834,6 +2835,7 @@ pub fn build_production_registry(
     registry.register(Arc::new(EditFileTool));
     registry.register(Arc::new(ShellTool::new(shells)));
     registry.register(Arc::new(TodoTool));
+    registry.register(Arc::new(UndoTool));
     registry
 }
 
@@ -3445,6 +3447,7 @@ mod tests {
     use crate::store::db::{Db, events_from_messages};
     use crate::tools::registry::ToolRegistry;
 use crate::tools::todo::TodoTool;
+use crate::tools::undo::UndoTool;
     use async_trait::async_trait;
     use futures::Stream;
     use tempfile::TempDir;
@@ -4029,6 +4032,7 @@ use crate::tools::todo::TodoTool;
                 "read_file",
                 "run_command",
                 "todo_write",
+                "undo",
                 "use_skill",
                 "write_file",
             ],

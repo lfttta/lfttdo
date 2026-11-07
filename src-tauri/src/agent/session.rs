@@ -15,6 +15,7 @@ use crate::tools::edit_file;
 use crate::tools::glob;
 use crate::tools::grep;
 use crate::tools::todo;
+use crate::tools::undo;
 use crate::tools::read_file;
 use crate::tools::registry::{ToolCtx, ToolRegistry};
 use crate::tools::use_skill;
@@ -184,6 +185,9 @@ fn filtered_tool_defs(
     }
     if !todo::usable_with_roots(roots) {
         tools.retain(|d| d.name != todo::NAME);
+    }
+    if !undo::usable_with_roots(roots) {
+        tools.retain(|d| d.name != undo::NAME);
     }
     if !has_skills {
         tools.retain(|d| d.name != use_skill::NAME);
