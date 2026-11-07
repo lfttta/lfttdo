@@ -157,6 +157,7 @@ mod tests {
             skills_dir: None,
             skills_disabled: vec![],
             subagents: None,
+            events: None,
         }
     }
 
