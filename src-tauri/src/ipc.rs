@@ -30,6 +30,7 @@ use crate::tools::grep::GrepTool;
 use crate::tools::memory_search::MemorySearchTool;
 use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::task::TaskTool;
 use crate::tools::todo::TodoTool;
 use crate::tools::undo::UndoTool;
 use crate::tools::shell::{
@@ -2869,6 +2870,9 @@ pub fn build_production_registry(
     registry.register(Arc::new(WriteFileTool));
     registry.register(Arc::new(EditFileTool));
     registry.register(Arc::new(ShellTool::new(shells)));
+    // G16：task 子代理。runner 由会话循环装配进 ToolCtx（`session::run`）——
+    // 注册表只注册工具壳，没有 runner 的执行上下文里它会明确报错（fail-closed）。
+    registry.register(Arc::new(TaskTool));
     registry.register(Arc::new(TodoTool));
     registry.register(Arc::new(UndoTool));
     registry
@@ -3481,8 +3485,6 @@ mod tests {
     use crate::permission::gate::PermissionGate;
     use crate::store::db::{Db, events_from_messages};
     use crate::tools::registry::ToolRegistry;
-use crate::tools::todo::TodoTool;
-use crate::tools::undo::UndoTool;
     use async_trait::async_trait;
     use futures::Stream;
     use tempfile::TempDir;
@@ -4069,6 +4071,7 @@ use crate::tools::undo::UndoTool;
                 "memory_search",
                 "read_file",
                 "run_command",
+                "task",
                 "todo_write",
                 "undo",
                 "use_skill",
@@ -4095,6 +4098,13 @@ use crate::tools::undo::UndoTool;
                 "{name} 必须走 Write 档，权限门才会弹窗；降成 Read 等于绕开用户"
             );
         }
+        // G16：task 是 Write 档 —— 子代理自主烧多轮请求，这一下必须弹窗；
+        // 降 Read 等于绕开权限门。
+        assert_eq!(
+            r.risk_of("task"),
+            Risk::Write,
+            "task 必须走 Write 档：派子代理前让用户看得见、拦得住"
+        );
         // Agent Shell（spec §2/§8）：`run_command` 是第一把内置 Exec 工具，风险唯一真相源
         // 是 `ShellTool::meta()`（经 `risk_of` 出）。它降档就等于绕开权限门的每次弹窗。
         assert_eq!(
@@ -6087,6 +6097,7 @@ use crate::tools::undo::UndoTool;
                     roots: Vec::new(),
                     skills_dir: None,
                     skills_disabled: Vec::new(),
+                    subagents: None,
                 },
             )
             .await

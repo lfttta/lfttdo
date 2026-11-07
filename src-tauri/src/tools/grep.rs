@@ -314,6 +314,7 @@ mod tests {
             write_root: None,
             skills_dir: None,
             skills_disabled: vec![],
+            subagents: None,
         }
     }
 
