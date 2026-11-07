@@ -3,12 +3,19 @@ pub mod echo;
 pub mod edit_file;
 pub mod fetch;
 pub mod fetch_guard;
+pub mod glob;
+pub mod grep;
 pub(crate) mod fs_write;
 pub mod memory_search;
+pub(crate) mod output_bound;
 pub mod read_file;
 pub mod registry;
 // run_command（agent 的 shell 执行工具）：2026-11-01 先交付接口契约桩，
 // spec 见 docs/superpowers/specs/2026-11-01-agent-shell-selection-design.md。
 pub mod shell;
+pub mod task;
+pub mod todo;
+pub mod undo;
 pub mod use_skill;
+pub mod websearch;
 pub mod write_file;
