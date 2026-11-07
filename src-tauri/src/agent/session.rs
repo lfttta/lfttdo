@@ -12,6 +12,8 @@ use crate::model::assistant_acc::AssistantAcc;
 use crate::model::provider::{ChatRequest, ModelDelta, ModelProvider, ToolDef};
 use crate::permission::gate::PermissionGate;
 use crate::tools::edit_file;
+use crate::tools::glob;
+use crate::tools::grep;
 use crate::tools::read_file;
 use crate::tools::registry::{ToolCtx, ToolRegistry};
 use crate::tools::use_skill;
@@ -139,6 +141,12 @@ fn filtered_tool_defs(
     has_skills: bool,
 ) -> Vec<ToolDef> {
     let mut tools = registry.defs();
+    if !glob::usable_with_roots(roots) {
+        tools.retain(|d| d.name != glob::NAME);
+    }
+    if !grep::usable_with_roots(roots) {
+        tools.retain(|d| d.name != grep::NAME);
+    }
     if !read_file::usable_with_roots(roots) {
         tools.retain(|d| d.name != read_file::NAME);
     }
