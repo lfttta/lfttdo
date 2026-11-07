@@ -25,9 +25,13 @@ use crate::store::db::{Db, SessionRow, events_from_messages};
 use crate::store::memory::{MemoryRow, MemoryWrite, RecallCfg};
 use crate::tools::edit_file::EditFileTool;
 use crate::tools::fetch::FetchTool;
+use crate::tools::glob::GlobTool;
+use crate::tools::grep::GrepTool;
 use crate::tools::memory_search::MemorySearchTool;
 use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::todo::TodoTool;
+use crate::tools::undo::UndoTool;
 use crate::tools::shell::{
     ShellCatalog, ShellProfile, ShellTool, detected_presets, ensure_executable, path_search_dirs,
     validate_custom,
@@ -1609,6 +1613,24 @@ pub async fn send_message(
     // 每次执行看到的都是这份。这一行没法单测（`#[tauri::command]` 在单测里调不动），
     // 「值真的可解析」由 `shell_catalog_of` 的纯函数测试与 settings 侧 normalize 钉着。
     *crate::lock::write(&state.shells) = shell_catalog_of(&settings);
+    // G13：工具级权限规则（`settings.permission_rules` → gate）。生效时机与上面的 shell
+    // catalog、下面的 roots 同一条线 —— 每轮开头现读设置，**改完设置发下一条消息就生效**，
+    // 不做实时热更（轮内不变：正在跑的那一轮不换规则表）。
+    // `None`（没配过 / 已清空）时清空规则表，回到默认路径；形状非法时
+    // `set_rules_from_json` 报 Err，这里降级为 warn + 清空 —— fail-safe：规则缺失只会
+    // 回到「按默认问人」，绝不静默沿用上一轮的旧规则，也绝不让一条配错的规则拦停整条消息。
+    // 这一段没法单测（`#[tauri::command]` 在单测里调不动，同上面 shell catalog 那行）：
+    // 解析/替换/Err 语义由 `gate.rs` 的内联测试钉着，端到端行为由 `tests/gapcheck2.rs`
+    // 的 G13 验收测试钉着。
+    match &settings.permission_rules {
+        Some(v) => {
+            if let Err(reason) = state.gate.set_rules_from_json(v) {
+                tracing::warn!("permission_rules 形状非法，本轮忽略并清空规则：{reason}");
+                state.gate.rules().clear_tool_rules();
+            }
+        }
+        None => state.gate.rules().clear_tool_rules(),
+    }
     // R90：`normalize_base_url("")` 返回空串，settings.rs 不替用户编一个默认端点，
     // 所以这道守卫必须住在装配层 —— 空 base_url 到这里就停。
     if settings.base_url.trim().is_empty() {
@@ -2822,12 +2844,16 @@ pub fn build_production_registry(
 ) -> Arc<ToolRegistry> {
     let registry = Arc::new(ToolRegistry::new());
     registry.register(Arc::new(FetchTool::new()));
+    registry.register(Arc::new(GlobTool));
+    registry.register(Arc::new(GrepTool));
     registry.register(Arc::new(ReadFileTool));
     registry.register(Arc::new(UseSkillTool));
     registry.register(Arc::new(MemorySearchTool::new(db)));
     registry.register(Arc::new(WriteFileTool));
     registry.register(Arc::new(EditFileTool));
     registry.register(Arc::new(ShellTool::new(shells)));
+    registry.register(Arc::new(TodoTool));
+    registry.register(Arc::new(UndoTool));
     registry
 }
 
@@ -3438,6 +3464,8 @@ mod tests {
     use crate::permission::gate::PermissionGate;
     use crate::store::db::{Db, events_from_messages};
     use crate::tools::registry::ToolRegistry;
+use crate::tools::todo::TodoTool;
+use crate::tools::undo::UndoTool;
     use async_trait::async_trait;
     use futures::Stream;
     use tempfile::TempDir;
@@ -4001,7 +4029,7 @@ mod tests {
     /// `echo` / `guarded` 这类替身只该活在 `#[cfg(test)]` 里 —— 它们的名字一旦进生产，
     /// 请求体里就多出一条用户看不懂、实现也不是给用户的工具。
     #[test]
-    fn production_registry_ships_the_seven_builtin_tools() {
+    fn production_registry_ships_the_builtin_tools() {
         let (_dir, db) = (
             tempfile::tempdir().unwrap(),
             Arc::new(Db::open(&tempfile::tempdir().unwrap().path().join("r.db")).unwrap()),
@@ -4016,9 +4044,13 @@ mod tests {
             vec![
                 "edit_file",
                 "fetch_url",
+                "glob",
+                "grep",
                 "memory_search",
                 "read_file",
                 "run_command",
+                "todo_write",
+                "undo",
                 "use_skill",
                 "write_file",
             ],
