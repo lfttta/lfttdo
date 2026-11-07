@@ -6,10 +6,14 @@
 // key「不写 settings 表、不进导出、不写日志」，三条里最容易失守的是第一条，而靠纪律
 // （「记得别写」）守的规矩一定会被下一次加字段破掉；字段不存在才是结构性防线：
 // serde 写不出一个不存在的字段，`{:?}` 打不出它，导出也就无从带上它。
-// `serialized_field_names_are_exactly_the_twenty_six_settings_fields` 那条测试钉的正是这件事，
+// `serialized_field_names_are_exactly_the_twenty_nine_settings_fields` 那条测试钉的正是这件事，
 // 它同时也是 R89 的防线：加字段必须先给出它的消费者，否则 Plan A 里多一个没人读的键。
 // （T26 落 `roots` 时它的名字从 `twelve` 变成 `thirteen`，shell 选择功能落
-// `default_shell`/`shells` 时变到 `twenty_six` —— 名字里的数字就是这条防线的读数。）
+// `default_shell`/`shells` 时变到 `twenty_six`，G13 落 `permission_rules`（消费者是
+// `ipc.rs::send_message` → `PermissionGate`）时变到 `twenty_seven`，G15 落 `plan_mode`
+// （消费者是 `ipc.rs::run_turn` → `SessionConfig`）时变到 `twenty_eight`，G18 落
+// `diagnostics_command`（同一消费者）时变到 `twenty_nine` —— 名字里的数字就是
+// 这条防线的读数。）
 //
 // 「不写日志」那一条还有第二道闸，而且不在结构体上：`SettingsError` 的 `Debug` 是**手写**的
 // （R94，见 `impl fmt::Debug`）。`keyring_core::Error` 自己 derive 了 `Debug`，而它的
@@ -182,7 +186,7 @@ pub enum SettingsError {
 /// 打成十进制转储 —— spec :473 说的「不写日志」在这种形态下守不住，而且 spec :543 计划的
 /// 「全文搜索 key 字符串」根本查不到十进制转储。Display 侧本来就安全（那两个变体的 Display
 /// 只说 "Password data is not valid UTF-8"），所以这里每一支都借 Display 落地。
-/// `serialized_field_names_are_exactly_the_twenty_six_settings_fields` 同族的
+/// `serialized_field_names_are_exactly_the_twenty_nine_settings_fields` 同族的
 /// `credential_debug_never_prints_the_secret_bytes` 钉住它。
 impl std::fmt::Debug for SettingsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -409,6 +413,30 @@ pub struct Settings {
     /// （不是预设 id 也不是任何自定义 id）回落 `DEFAULT_PRESET_ID`
     /// （同 accent「认不出来回落预设」的取向，不报错）。
     pub default_shell: String,
+    /// G13：工具级权限规则（OpenCode 风格）的**原文**。线格式见
+    /// `RuleTable::set_tool_rules_from_json`：`{"run_command": [{"pattern": "git *",
+    /// "action": "allow"}], "edit_file": "deny"}`。这里只存 `Value` 不解析 —— 解析、
+    /// 校验与 Err 语义单一住在 gate（R86 同取向：一个字段一处真相），normalize 的
+    /// 「只调不报错」纪律管不到形状预审，所以本字段不做归一（见 `normalize` 尾注）。
+    /// `None`/缺失 = 没有规则：装配侧（`ipc.rs::send_message`）喂 `None` 时清空规则表，
+    /// 回到默认弹窗路径；形状非法时装配侧 warn + 清空（fail-safe 方向：规则缺失只会
+    /// 回到「按默认问人」，绝不静默沿用旧规则）。
+    pub permission_rules: Option<serde_json::Value>,
+    /// G15：plan 模式（OpenCode 的「只读研究」agent）。`true` = 会话里写入/命令类
+    /// 工具调用被直接拒绝（session.rs 的 `PLAN_MODE_NOTE`，不执行、不走权限门），
+    /// 读类照常 —— 让模型先调研出方案，退出 plan 模式后再执行修改。消费方是
+    /// `ipc.rs::run_turn`（经 `SessionConfig.plan_mode` / `AgentSession::with_config`
+    /// 注入），每轮现取：改设置下一条消息生效。bool 无可钳位的形状，normalize
+    /// 不碰它（见 `normalize` 尾注）。
+    pub plan_mode: bool,
+    /// G18：诊断命令（OpenCode 把「编辑后的诊断」反馈给模型的离线等价物）。
+    /// write_file / edit_file 成功落盘后，会话循环每轮跑一次该命令，stdout+stderr
+    /// 作为 `【自动诊断】` 合成 user 轮追加进历史 —— 模型下一轮就能看到。例如
+    /// `"cargo check --message-format short"`。**每次写文件都会跑**：慢命令会拖慢
+    /// 对话节奏，是否开启自行取舍。`None`/空串 = 关闭（行为与没有本功能时逐字节
+    /// 一致）。normalize 透传（trim 与否是语义：空串按「关闭」判在使用点，不在
+    /// 这里预判）。
+    pub diagnostics_command: Option<String>,
 }
 
 impl Default for Settings {
@@ -460,6 +488,12 @@ impl Default for Settings {
             // Agent Shell：默认没有自定义 profile，默认 shell 是预设 bash（spec §5.2/§6）。
             shells: Vec::new(),
             default_shell: DEFAULT_PRESET_ID.into(),
+            // G13：默认没有权限规则 —— 默认路径就是既有弹窗语义，一个字节都不多放行。
+            permission_rules: None,
+            // G15：默认是普通会话 —— plan 拦截不存在，工具路径行为一个字不变。
+            plan_mode: false,
+            // G18：默认没有诊断命令 —— 历史组装与现状逐字节一致。
+            diagnostics_command: None,
         }
     }
 }
@@ -748,6 +782,16 @@ impl Settings {
         } else {
             DEFAULT_PRESET_ID.into()
         };
+        // G13：`permission_rules` **不归一** —— 它是原文透传的 `Value`，解析与校验唯一
+        // 住在 `RuleTable::set_tool_rules_from_json`（装配侧喂）。`None`/缺失在这里就是
+        // `None`，`Some` 原样保留：不改造、不预审形状（normalize 只调不报错的纪律
+        // 管不到它，两条纪律在这里交汇的结果就是什么都不做 —— 这个「不做」是写明的，
+        // 不是遗漏）。
+        // G15：`plan_mode` 是 bool，只有两个合法值，没有可钳位的形状 —— normalize
+        // 对它同样是刻意的不做。
+        // G18：`diagnostics_command` 同为透传（`None`/空串都按「关闭」处理，判定住在
+        // 使用点 `session::run`），normalize 不 trim 不校验 —— 命令怎么写是用户的自由，
+        // 跑不跑得起来由执行点自己 fail-safe。
     }
 
     /// 归一后的副本。派生方法用它，省掉「调用者忘了先 normalize」这条静默错误路径。
@@ -2265,6 +2309,7 @@ mod tests {
             roots: Settings::default().roots,
             skills_dir: None,
             skills_disabled: Vec::new(),
+            subagents: None,
         };
         let e = ctx
             .resolve_within_roots(&file.to_string_lossy())
@@ -2562,7 +2607,7 @@ mod tests {
     // ---- R89：不加没有消费者的字段 ----
 
     #[test]
-    fn serialized_field_names_are_exactly_the_twenty_six_settings_fields() {
+    fn serialized_field_names_are_exactly_the_twenty_nine_settings_fields() {
         let json = serde_json::to_value(Settings::default()).unwrap();
         let mut keys: Vec<&str> = json
             .as_object()
@@ -2579,6 +2624,7 @@ mod tests {
                 "budget_tokens",
                 "compact_threshold",
                 "default_shell",
+                "diagnostics_command",
                 "font_size",
                 "keep_turns",
                 "memory_decay_half_life_days",
@@ -2592,6 +2638,8 @@ mod tests {
                 "memory_recall_k",
                 "mode",
                 "model",
+                "permission_rules",
+                "plan_mode",
                 "reserve_output",
                 "roots",
                 "shells",
@@ -3289,5 +3337,135 @@ mod tests {
         assert_send_sync::<SettingsStore>();
         assert_send_sync::<Settings>();
         assert_send_sync::<SettingsError>();
+    }
+
+    // ---- G13：permission_rules ----
+
+    /// 字段默认 None（没配过规则 = 默认弹窗路径原样）；normalize 对它**原文透传**：
+    /// Some 原样保留（解析与校验唯一住在 gate，见字段文档），None/缺失就是 None。
+    #[test]
+    fn permission_rules_defaults_to_none_and_normalize_passes_the_value_through() {
+        assert_eq!(
+            Settings::default().permission_rules,
+            None,
+            "默认必须没有规则"
+        );
+        let rules = serde_json::json!({"run_command": [{"pattern": "git *", "action": "allow"}]});
+        let n = Settings {
+            permission_rules: Some(rules.clone()),
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(
+            n.permission_rules,
+            Some(rules),
+            "normalize 原文透传，不预审形状"
+        );
+    }
+
+    /// round-trip：存进去的规则原文 load 回来同值；没写这个键的旧文件读回来是 None
+    /// （serde(default) 的向前兼容 —— 旧程序读新文件、新程序读旧文件都不丢设置）。
+    #[test]
+    fn permission_rules_survive_a_save_load_round_trip() {
+        let d = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(d.path());
+        let rules = serde_json::json!({
+            "run_command": [
+                {"pattern": "git *", "action": "allow"},
+                {"pattern": "rm *", "action": "deny"}
+            ],
+            "edit_file": "deny"
+        });
+        let s = Settings {
+            permission_rules: Some(rules.clone()),
+            ..Default::default()
+        };
+        store.save(&s).unwrap();
+        let got = store.load().unwrap();
+        assert_eq!(got.permission_rules, Some(rules), "规则原文要原样读回");
+
+        std::fs::write(store.path(), r#"{"model":"qwen-max"}"#).unwrap();
+        let got = store.load().unwrap();
+        assert_eq!(
+            got.permission_rules,
+            None,
+            "文件里没有这个键 = None，不许编出一个规则来"
+        );
+        assert_eq!(got.model, "qwen-max", "其余设置不受影响");
+    }
+
+    // ---- G15：plan_mode ----
+
+    /// 字段默认 false（普通会话，plan 拦截不存在）；bool 无可钳位的形状，normalize
+    /// 对它透传（写明这个「不做」是刻意的）；round-trip 保住 true；旧文件缺键 = false
+    /// （serde(default) 的向前兼容）。
+    #[test]
+    fn plan_mode_defaults_to_false_and_survives_a_save_load_round_trip() {
+        assert!(
+            !Settings::default().plan_mode,
+            "默认必须是普通会话，plan 拦截不存在"
+        );
+        let n = Settings {
+            plan_mode: true,
+            ..Default::default()
+        }
+        .normalized();
+        assert!(n.plan_mode, "normalize 透传 bool，不许翻转");
+
+        let d = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(d.path());
+        store
+            .save(&Settings {
+                plan_mode: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(store.load().unwrap().plan_mode, "round-trip 要保住 true");
+
+        std::fs::write(store.path(), r#"{"model":"qwen-max"}"#).unwrap();
+        assert!(
+            !store.load().unwrap().plan_mode,
+            "文件里没有这个键 = false，不许自己开 plan 模式"
+        );
+    }
+
+    // ---- G18：diagnostics_command ----
+
+    /// 字段默认 None（没有诊断反馈 = 现状）；normalize 透传（Some 原样保留，不 trim
+    /// 不校验）；round-trip 保住 Some；旧文件缺键 = None。
+    #[test]
+    fn diagnostics_command_defaults_to_none_and_survives_a_round_trip() {
+        assert_eq!(Settings::default().diagnostics_command, None);
+        let n = Settings {
+            diagnostics_command: Some("cargo check --message-format short".into()),
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(
+            n.diagnostics_command.as_deref(),
+            Some("cargo check --message-format short"),
+            "normalize 透传，不 trim 不改写"
+        );
+
+        let d = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(d.path());
+        store
+            .save(&Settings {
+                diagnostics_command: Some("cargo check".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap().diagnostics_command.as_deref(),
+            Some("cargo check"),
+            "round-trip 要保住命令原文"
+        );
+
+        std::fs::write(store.path(), r#"{"model":"qwen-max"}"#).unwrap();
+        assert_eq!(
+            store.load().unwrap().diagnostics_command,
+            None,
+            "文件里没有这个键 = None"
+        );
     }
 }
