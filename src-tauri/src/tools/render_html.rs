@@ -176,18 +176,24 @@ mod tests {
         let text = text_of(out);
         assert!(text.contains("已渲染「测试卡片」"), "{text}");
         assert!(text.contains("rendered"), "{text}");
-        // 输出里的绝对路径真实存在、内容逐字节一致。
-        let base = tmp.path().to_str().unwrap();
-        let start = text.find(base).unwrap();
-        let end = text[start..].find('\n').unwrap_or(text.len() - start);
-        let line = &text[start..start + end];
-        let path = Path::new(line.trim());
+        // 输出里的绝对路径真实存在、内容逐字节一致。**按 `→` 分隔符取路径**，不做
+        // `find(临时目录原文)`：CI（GitHub runner）的 TEMP 是 8.3 短路径（RUNNER~1），
+        // 而 canonicalize 落盘的是长路径，字面查找会找不到同一个目录（CI 实测翻过车）。
+        // 落点是否在 tmp 下改用 canonicalize 后的前缀比对，长短路径免疫。
+        let line = text.lines().find(|l| l.contains("→ ")).expect("→ 路径行");
+        let path = Path::new(line.split("→ ").nth(1).unwrap().trim());
+        assert!(path.is_absolute(), "{path:?}");
         assert_eq!(std::fs::read_to_string(path).unwrap(), "<p>你好</p>");
         assert!(
             path.to_str()
                 .unwrap()
                 .replace('\\', "/")
                 .contains("rendered/")
+        );
+        let tmp_canon = tmp.path().canonicalize().unwrap();
+        assert!(
+            path.canonicalize().unwrap().starts_with(&tmp_canon),
+            "落点必须在会话输出目录内：{path:?} vs {tmp_canon:?}"
         );
     }
 
@@ -202,9 +208,9 @@ mod tests {
         );
         let b = text_of(run(input, Some(tmp.path().to_path_buf())).await.unwrap());
         let path_of = |t: &str| {
-            let start = t.find(tmp.path().to_str().unwrap()).unwrap();
-            let end = t[start..].find('\n').unwrap_or(t.len() - start);
-            t[start..start + end].to_string()
+            // 同上：按 `→` 取路径，不做临时目录的字面查找（长短路径不一致会翻车）。
+            let line = t.lines().find(|l| l.contains("→ ")).expect("→ 路径行");
+            line.split("→ ").nth(1).unwrap().trim().to_string()
         };
         assert_eq!(path_of(&a), path_of(&b), "同内容哈希同名，不重复占盘");
     }
