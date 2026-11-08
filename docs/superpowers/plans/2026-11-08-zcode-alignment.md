@@ -33,7 +33,9 @@
 | G39 | rewind 第一版「重试这一轮」：`Db::truncate_last_user_turn`（真人判别三道与 latest_user_message 同线、单事务、保留压缩备注、返回原话块）+ `session_retry_last`（running guard，跑着不许重试）+ 前端最后一条 assistant 气泡「↻ 重试这一轮」→ 截断→重放→走**同一条 send** 重发（乐观插入/回滚/自动改名免费复用）。任意点回退与工具写入核对（file-summary-safe-rewind）留后续 | db.rs / ipc.rs / MessageBubble.tsx / MessageList.tsx / App.tsx / commands.ts | M | ✅ Rust 4 条 + 前端 3 条新测试 |
 | — | 欠账清偿：全仓 cargo fmt（ipc.rs ~2 万行重排系该文件首次格式化，整文件 diff 有 #70 先例）+ clippy 零警告 + 全量绿（Rust 979+3 / 前端 338） | 全仓 | — | ✅ |
 
-**待办**：真机验收五项（任务栏闪烁 / 导出对话框 / 占用条 / 重试按钮 / 折叠展开）；提交推送（工作区混着两会话的活且 ipc.rs 无法按文件分离，只能一个 commit）；推送后 gh 查 CI。
+**待办**：真机验收五项（任务栏闪烁 / 导出对话框 / 占用条 / 重试按钮 / 折叠展开）。
+
+**终态（2026-11-08 深夜）**：G35-G39、G42 全部落地并推送。第一轮 CI 7/8（`c9e2931` 的 DWM 常量在 Linux clippy 下 dead_code——`cfg(windows)` 函数引用的常量也要挂 cfg），补 `#[cfg(windows)]` 后复跑 **CI 8/8 全绿**（run 42493607254）。README 功能/已知限制已同步。下一批从 G40/G41 或 G43 起。
 
 ## 后续批次（按序，每批先写 spec）
 
