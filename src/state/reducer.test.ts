@@ -162,7 +162,7 @@ const probe: Record<AgentEvent["t"], AgentEvent> = {
   // 这条键本身就是「镜像有 13 支、reducer 有 13 臂」的机器判据之一（缺键 TS2741）。
   question: { t: "question", id: "q1", question: "选哪个方案？", options: ["方案一", "方案二"] },
   tool_result: toolResult("c1", "结果"),
-  usage: { t: "usage", input_tokens: 1, output_tokens: 2 },
+  usage: { t: "usage", input_tokens: 1, output_tokens: 2, budget: 27_904 },
   context_compacted: { t: "context_compacted", dropped: 4, summary_chars: 120 },
   // P1：放在 Rust 名单里的同一位置（`context_compacted` 与 `error` 之间）。
   memory_saved: { t: "memory_saved", count: 2 },
@@ -311,8 +311,14 @@ describe("reducer", () => {
   });
 
   it("records usage for the status bar", () => {
-    const s = reduce(initialState(), { t: "usage", input_tokens: 120, output_tokens: 30 });
-    expect(s.usage).toEqual({ input: 120, output: 30 });
+    const s = reduce(initialState(), {
+      t: "usage",
+      input_tokens: 120,
+      output_tokens: 30,
+      budget: 27_904,
+    });
+    // G35：budget 原样进状态 —— 占比条的分母从事件来，前端不算减法。
+    expect(s.usage).toEqual({ input: 120, output: 30, budget: 27_904 });
   });
 
   it("replays a persisted history into the same shape a live session produced", () => {
@@ -698,7 +704,7 @@ describe("reducer", () => {
       { t: "workflow_step", workflow: "流水", step: "步", index: 1, total: 2, status: "running" },
       { t: "experiment_run", command_tail: "echo hi", repeat: 1, of: 2, metrics: null },
       toolResult("c1", "结果", true, 4),
-      { t: "usage", input_tokens: 7, output_tokens: 8 },
+      { t: "usage", input_tokens: 7, output_tokens: 8, budget: 27_904 },
       { t: "context_compacted", dropped: 1, summary_chars: 2 },
       { t: "memory_saved", count: 4 },
       { t: "error", where: "store", message: "写库失败", fatal: true },
@@ -723,7 +729,7 @@ describe("reducer", () => {
       permRequest("p1"),
       { t: "permission_resolved", id: "p1", decision: { allow: true, scope: "once" } },
       { t: "error", where: "mcp", message: "超时", fatal: false },
-      { t: "usage", input_tokens: 3, output_tokens: 4 },
+      { t: "usage", input_tokens: 3, output_tokens: 4, budget: 27_904 },
       { t: "context_compacted", dropped: 9, summary_chars: 30 },
       { t: "memory_saved", count: 2 },
       done("max_turns"),
@@ -786,7 +792,13 @@ describe("reducer", () => {
       "preview",
       "images",
     ]);
-    expect(Object.keys(probe.usage)).toEqual(["t", "input_tokens", "output_tokens"]);
+    // G35：budget 随 usage 上线（Rust 侧算好的净预算），线上键数加一。
+    expect(Object.keys(probe.usage)).toEqual([
+      "t",
+      "input_tokens",
+      "output_tokens",
+      "budget",
+    ]);
     expect(Object.keys(probe.error)).toEqual(["t", "where", "message", "fatal"]);
     expect(Object.keys(contentProbe.image)).toEqual(["type", "data", "mime"]);
     expect(CONTENT_TAGS).toHaveLength(4); // 对齐 types.rs:4-24 的四支

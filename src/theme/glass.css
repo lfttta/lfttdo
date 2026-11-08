@@ -295,3 +295,27 @@ html[data-theme][data-mode] .sidebar-plus {
   padding: 4px 0;
   font-size: 1.05em;
 }
+
+/* 2026-11-08 界面降噪轮新增的三处玻璃材质：
+   ① 复制 chip 是 button，本可以吃上面那条例行的玻璃 button 规则 —— 但它静止态
+      opacity: 0 悬在气泡角上，材质单独点名写在这里是为了和「添加图片」成对出现，
+      两枚 chip 一块改。
+   ② 「添加图片」的可见面是 span 不是 button：条例行的玻璃 button 规则按标签选，
+      罩不到它，不补的话玻璃模式下它是唯一一块系统默认模板的残留。
+   ③ 「确认删除」的危险描边：条例行 button 规则把 border 压成玻璃边（特异度更高），
+      styles.css 里那支 `--danger` 描边会被吃掉 —— 破坏性操作的确认条不能看不出危险。 */
+html[data-theme][data-mode] .copy-chip,
+html[data-theme][data-mode] .image-file-button {
+  background-color: var(--glass-bg-strong);
+  border: 1px solid var(--glass-border);
+  box-shadow: inset 0 1px 0 var(--glass-sheen-weak);
+}
+
+html[data-theme][data-mode] .image-file-entry:hover .image-file-button {
+  background-color: var(--glass-hover);
+}
+
+html[data-theme][data-mode] .session-delete-armed {
+  border-color: var(--danger);
+  color: var(--danger);
+}

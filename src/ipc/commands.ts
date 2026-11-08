@@ -87,6 +87,21 @@ export const replaySession = (id: string) =>
   invoke<AgentEvent[]>("session_messages", { id });
 
 /**
+ * G38：导出会话为 Markdown。Rust 侧弹原生保存对话框；用户取消 = `null`（不是错误，
+ * 界面静默），成功回保存路径（供通知文案显示「存到了哪」）。
+ */
+export const exportSession = (id: string) =>
+  invoke<string | null>("session_export", { sessionId: id });
+
+/**
+ * G39：重试最后一轮 —— 截断库里最后一轮的全部行，返回被删那轮的用户原话块
+ * （text/image，拿去原样重发）。`null` = 没有可重试的轮（空会话/只剩备注与辅助行），
+ * 不是错误。正在跑的那一轮由 Rust 侧 guard 拒绝（Err 文案直接可上屏）。
+ */
+export const retryLastSession = (id: string) =>
+  invoke<ContentBlock[] | null>("session_retry_last", { id });
+
+/**
  * `settings_get` 返回**拍平一层**的 `SettingsView`（`ipc.rs:488-500` 的 `#[serde(flatten)]`），
  * 不是 `Settings`。`api_key_masked` 与 `corrupt_backup` 都可以是 `null`（R99 / R102）。
  */

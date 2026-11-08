@@ -303,7 +303,11 @@ export function reduce(state: UiState, e: AgentEvent): UiState {
       );
 
     case "usage":
-      return { ...state, usage: { input: e.input_tokens, output: e.output_tokens } };
+      // G35：budget 原样进状态 —— 占比条的分母从事件来，前端不算减法。
+      return {
+        ...state,
+        usage: { input: e.input_tokens, output: e.output_tokens, budget: e.budget },
+      };
 
     case "context_compacted":
       return notice(

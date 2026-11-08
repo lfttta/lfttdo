@@ -50,6 +50,26 @@ describe("ImageStrip", () => {
     fireEvent.click(screen.getByRole("button", { name: "移除 第二张.jpeg" }));
     expect(onRemove).toHaveBeenCalledWith(1);
   });
+
+  // 2026-11-08 换成「label + 视觉隐藏 input」后钉两条：可见面是「添加图片」这枚
+  // chip（文案归 DOM，不再是 UA 画的那串「选择文件」），input 本体还在且 testid
+  // 不变 —— 选择器行为（change → onPick）由下面「accepts the file picker」那条钉着。
+  it("offers the picker through a labelled 添加图片 chip with the input intact", () => {
+    render(
+      <ImageStrip
+        images={[]}
+        errors={[]}
+        ignored={0}
+        disabled={false}
+        onRemove={() => {}}
+        onPick={() => {}}
+      />,
+    );
+    expect(screen.getByText("添加图片")).toBeInTheDocument();
+    const input = screen.getByTestId("file-input");
+    expect(input).toHaveAttribute("type", "file");
+    expect(input).toHaveAccessibleName("添加图片");
+  });
 });
 
 describe("Composer 图片入口", () => {

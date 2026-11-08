@@ -186,6 +186,7 @@ mod tests {
         let mut event = AgentEvent::Usage {
             input_tokens: 1,
             output_tokens: 2,
+            budget: 0,
         };
         enrich_event(&mut event, dir.path());
         assert!(matches!(event, AgentEvent::Usage { .. }));

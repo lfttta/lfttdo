@@ -14,6 +14,8 @@ interface SidebarProps {
   onCreate: () => void;
   onDelete: (id: string) => void;
   onRename: (id: string, title: string) => void;
+  /** G38：导出该会话为 Markdown（Rust 侧弹保存对话框；取消由 App 静默）。 */
+  onExport: (id: string) => void;
 }
 
 /**
@@ -38,9 +40,18 @@ export function Sidebar({
   onCreate,
   onDelete,
   onRename,
+  onExport,
 }: SidebarProps) {
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  /**
+   * 删除的两段式确认：`armedId` 是当前「上膛」的那一行（同一时刻最多一行）。
+   * 设置面板里「清除已存的 key → 确认清除/取消」已经是这个模式；会话删除同样不可恢复，
+   * 一键直删的代价是一次误点，而「点删除 → 浮出确认条 → 再点确认」只多一次点击。
+   * 上膛状态在任何「换了主意」的动作上收枪：点取消、按 Esc、点别的行（选中/重命名/
+   * 删除另一行都会重置）—— 收枪必须便宜，否则用户会为了逃避误删而害怕点删除。
+   */
+  const [armedId, setArmedId] = useState<string | null>(null);
   const sorted = [...rows].sort((a, b) => b.updated_at - a.updated_at);
 
   const submitRename = (id: string) => {
@@ -56,6 +67,9 @@ export function Sidebar({
       className="sidebar"
       aria-label="会话列表"
       data-collapsed={collapsed}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") setArmedId(null);
+      }}
     >
       <div className="sidebar-head">
         <button
@@ -93,7 +107,10 @@ export function Sidebar({
             <button
               type="button"
               className="session-title"
-              onClick={() => onSelect(r.id)}
+              onClick={() => {
+                setArmedId(null);
+                onSelect(r.id);
+              }}
             >
               {r.title}
             </button>
@@ -101,6 +118,7 @@ export function Sidebar({
               type="button"
               className="session-rename"
               onClick={() => {
+                setArmedId(null);
                 setEditing(r.id);
                 setDraft(r.title);
               }}
@@ -109,8 +127,18 @@ export function Sidebar({
             </button>
             <button
               type="button"
+              className="session-export"
+              onClick={() => {
+                setArmedId(null);
+                onExport(r.id);
+              }}
+            >
+              导出
+            </button>
+            <button
+              type="button"
               className="session-delete"
-              onClick={() => onDelete(r.id)}
+              onClick={() => setArmedId(r.id)}
             >
               删除
             </button>
@@ -126,6 +154,31 @@ export function Sidebar({
                   onClick={() => submitRename(r.id)}
                 >
                   提交重命名
+                </button>
+              </div>
+            ) : null}
+            {armedId === r.id ? (
+              <div
+                className="delete-confirm"
+                data-testid={`delete-confirm-${r.id}`}
+              >
+                <span className="delete-confirm-text">删除会话？</span>
+                <button
+                  type="button"
+                  className="session-delete-armed"
+                  onClick={() => {
+                    setArmedId(null);
+                    onDelete(r.id);
+                  }}
+                >
+                  确认删除
+                </button>
+                <button
+                  type="button"
+                  className="session-delete-cancel"
+                  onClick={() => setArmedId(null)}
+                >
+                  取消
                 </button>
               </div>
             ) : null}

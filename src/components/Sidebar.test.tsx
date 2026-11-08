@@ -28,6 +28,7 @@ function setup(over: Partial<Parameters<typeof Sidebar>[0]> = {}) {
     onCreate: vi.fn(),
     onDelete: vi.fn(),
     onRename: vi.fn(),
+    onExport: vi.fn(),
     onOpenSkills: vi.fn(),
     ...over,
   };
@@ -89,11 +90,92 @@ describe("Sidebar", () => {
     expect(props.onRename).not.toHaveBeenCalled();
   });
 
-  it("deletes the session the button belongs to", () => {
+  // G38：导出走行内按钮，把会话 id 交给 App（对话框与写文件都在 Rust 侧）。
+  // 顺手钉一条：导出会收枪 —— 上膛的删除确认不该因为点了导出还挂在那一行。
+  it("exports a session through its row button and disarms the armed deletion", () => {
+    const props = setup();
+    const row = screen.getByTestId("session-row-old");
+    fireEvent.click(within(row).getByRole("button", { name: /删除/ }));
+    expect(
+      within(screen.getByTestId("session-row-old")).getByTestId(
+        "delete-confirm-old",
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(within(row).getByRole("button", { name: /导出/ }));
+    expect(props.onExport).toHaveBeenCalledWith("old");
+    expect(
+      within(screen.getByTestId("session-row-old")).queryByTestId(
+        "delete-confirm-old",
+      ),
+    ).toBeNull();
+  });
+
+  // 两段式确认（2026-11-08）：删除不可恢复，第一击只「上膛」——浮出确认条，
+  // 第二击才把 id 交给 onDelete。每条用例的名字用**全等字符串**而不是 /删除/：
+  // 上膛之后行内同时存在「删除」和「确认删除」，正则会撞成两个匹配。
+  it("arms deletion first and deletes only on the second click", () => {
     const props = setup();
     const target = screen.getByTestId("session-row-mid");
-    fireEvent.click(within(target).getByRole("button", { name: /删除/ }));
+    fireEvent.click(within(target).getByRole("button", { name: "删除" }));
+    expect(props.onDelete).not.toHaveBeenCalled();
+    expect(screen.getByTestId("delete-confirm-mid")).toHaveTextContent(
+      "删除会话？",
+    );
+    fireEvent.click(
+      within(screen.getByTestId("delete-confirm-mid")).getByRole("button", {
+        name: "确认删除",
+      }),
+    );
     expect(props.onDelete).toHaveBeenCalledWith("mid");
+    // 确认之后确认条收起：一行不会永远挂着一条已经用完的确认。
+    expect(screen.queryByTestId("delete-confirm-mid")).toBeNull();
+  });
+
+  it("cancel aborts the armed deletion without deleting", () => {
+    const props = setup();
+    const target = screen.getByTestId("session-row-mid");
+    fireEvent.click(within(target).getByRole("button", { name: "删除" }));
+    fireEvent.click(
+      within(screen.getByTestId("delete-confirm-mid")).getByRole("button", {
+        name: "取消",
+      }),
+    );
+    expect(props.onDelete).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("delete-confirm-mid")).toBeNull();
+  });
+
+  it("re-arms the confirmation to the latest row when another delete is clicked", () => {
+    const props = setup();
+    fireEvent.click(
+      within(screen.getByTestId("session-row-old")).getByRole("button", {
+        name: "删除",
+      }),
+    );
+    fireEvent.click(
+      within(screen.getByTestId("session-row-new")).getByRole("button", {
+        name: "删除",
+      }),
+    );
+    expect(screen.queryByTestId("delete-confirm-old")).toBeNull();
+    fireEvent.click(
+      within(screen.getByTestId("delete-confirm-new")).getByRole("button", {
+        name: "确认删除",
+      }),
+    );
+    expect(props.onDelete).toHaveBeenCalledTimes(1);
+    expect(props.onDelete).toHaveBeenCalledWith("new");
+  });
+
+  it("disarms the armed deletion on Escape", () => {
+    const props = setup();
+    fireEvent.click(
+      within(screen.getByTestId("session-row-mid")).getByRole("button", {
+        name: "删除",
+      }),
+    );
+    fireEvent.keyDown(screen.getByRole("navigation"), { key: "Escape" });
+    expect(props.onDelete).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("delete-confirm-mid")).toBeNull();
   });
 
   it("opens the skills panel from the footer", () => {

@@ -19,6 +19,99 @@ function state(partial: Partial<UiState>): UiState {
 }
 
 describe("MessageList", () => {
+  // G42：超过 VISIBLE_TURNS 只渲染最近 40 条，更早的收进一个「展开」按钮 ——
+  // 折叠是渲染层裁剪，reducer 侧的 turns 不许少（那是另一层的事，这里只看 DOM）。
+  it("G42: renders only the last 40 turns behind an expand button when history is longer", () => {
+    const turns = Array.from({ length: 45 }, (_, i) => ({
+      id: i + 1,
+      role: "assistant" as const,
+      blocks: [{ kind: "text" as const, text: `消息 ${i + 1}` }],
+    }));
+    render(<MessageList state={state({ turns })} onRespond={() => {}} />);
+    // 45 条只上屏 40 条：最旧的 5 条（消息 1–5）不渲染。
+    expect(screen.queryByText("消息 5")).toBeNull();
+    expect(screen.getByText("消息 6")).toBeInTheDocument();
+    expect(screen.getByText("消息 45")).toBeInTheDocument();
+    expect(screen.getByTestId("turns-expand")).toHaveTextContent("展开更早的 5 条");
+  });
+
+  // G42：点击展开后全部可见，按钮随之消失（不做收起 —— 历史只增不减）。
+  it("G42: expanding reveals every turn and removes the button", () => {
+    const turns = Array.from({ length: 45 }, (_, i) => ({
+      id: i + 1,
+      role: "assistant" as const,
+      blocks: [{ kind: "text" as const, text: `消息 ${i + 1}` }],
+    }));
+    render(<MessageList state={state({ turns })} onRespond={() => {}} />);
+    fireEvent.click(screen.getByTestId("turns-expand"));
+    expect(screen.getByText("消息 1")).toBeInTheDocument();
+    expect(screen.getByText("消息 45")).toBeInTheDocument();
+    expect(screen.queryByTestId("turns-expand")).toBeNull();
+  });
+
+  // G42：不超过 40 条时不渲染按钮 —— 折叠入口只在真有隐藏内容时出现，
+  // 否则短会话顶上常驻一个点了没反应的「展开 0 条」。
+  it("G42: never shows the expand button when everything fits", () => {
+    const turns = Array.from({ length: 40 }, (_, i) => ({
+      id: i + 1,
+      role: "assistant" as const,
+      blocks: [{ kind: "text" as const, text: `消息 ${i + 1}` }],
+    }));
+    render(<MessageList state={state({ turns })} onRespond={() => {}} />);
+    expect(screen.getByText("消息 1")).toBeInTheDocument();
+    expect(screen.queryByTestId("turns-expand")).toBeNull();
+  });
+
+  // G39：重试按钮只出现在「非流式的最后一条 assistant 气泡」上，点击把动作交给
+  // onRetryLast（截断→重放→重发整条链在 App，这里只验按钮的可见性与出口）。
+  it("G39: offers retry only on the finished last assistant turn", () => {
+    const onRetryLast = vi.fn();
+    const { rerender } = render(
+      <MessageList
+        state={state({
+          turns: [
+            { id: 1, role: "user", blocks: [] },
+            { id: 2, role: "assistant", blocks: [{ kind: "text", text: "答案" }] },
+          ],
+        })}
+        onRespond={() => {}}
+        onRetryLast={onRetryLast}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("bubble-retry"));
+    expect(onRetryLast).toHaveBeenCalledTimes(1);
+    // 上一条 user 气泡上没有重试钮（整个文档只有一支）。
+    expect(screen.getAllByTestId("bubble-retry")).toHaveLength(1);
+    // 流式中按钮消失：这一轮还在跑，截断会跟落库赛跑。
+    rerender(
+      <MessageList
+        state={state({
+          streaming: true,
+          turns: [
+            { id: 1, role: "user", blocks: [] },
+            { id: 2, role: "assistant", blocks: [{ kind: "text", text: "答案" }] },
+          ],
+        })}
+        onRespond={() => {}}
+        onRetryLast={onRetryLast}
+      />,
+    );
+    expect(screen.queryByTestId("bubble-retry")).toBeNull();
+  });
+
+  // G39：没接 onRetryLast（测试/纯展示场景）按钮整支不渲染 —— 缺省是安全的。
+  it("G39: renders no retry button without an onRetryLast outlet", () => {
+    render(
+      <MessageList
+        state={state({
+          turns: [{ id: 2, role: "assistant", blocks: [{ kind: "text", text: "答案" }] }],
+        })}
+        onRespond={() => {}}
+      />,
+    );
+    expect(screen.queryByTestId("bubble-retry")).toBeNull();
+  });
+
   // 真窗口实测（R234）：发一条消息后 `.bubble-assistant` 立刻存在而且是空的，
   // 质感层给它加了内边距与投影，于是屏幕左侧浮出一个没有任何含义的小胶囊。
   // 同一个空元素在「正在生成」和「这一轮已经死了（401/中断）」两种状态下长得一模一样，

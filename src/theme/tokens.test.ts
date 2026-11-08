@@ -606,12 +606,15 @@ describe("theme tokens", () => {
     }
   });
 
-  // 界面质感那条委托里唯一还在「说浏览器方言」的一处：file 控件由 UA 自己画两样东西 ——
-  // 一枚「选择文件」按钮和一段「未选择文件」文案。文案那半改不掉，只能把承载它的控件
-  // `font-size` 归零；而按钮那一侧的 `font: inherit` 会把这个 0 一起继承走。
-  // 所以这条闸盯的是这个**成对**关系（只写一半的症状：按钮缩成零尺寸、点不着），
-  // 外加一条反向的：`content` 在这个引擎上是装饰。
-  // jsdom 看不见 CSS，判法同上一条：源码级正则（R235 立的口径）。
+  // 「选择文件 / 未选择文件」那两样 UA 画的产物，2026-11-08 起不再靠「字号归零 +
+  // 伪元素皮肤」来对付：入口换成了「label + 视觉隐藏的 input」（ImageStrip.tsx），
+  // 可见面是「添加图片」这枚我们自己的 DOM（文案那条闸由 ImageStrip.test 钉着）。
+  // 这条闸改钉新机制的两条腿：
+  // ① input 必须视觉隐藏（clip-path 那一族），且不许退回 display:none ——
+  //    label 的点击激活依赖 input 处在可点击状态；
+  // ② `::file-selector-button` 的皮肤规则必须彻底消失 —— UA 按钮已经看不见了，
+  //    留着皮肤只会骗下一个读代码的人以为那串文案是我们定的。
+  // jsdom 看不见 CSS，判法同当年：源码级正则（R235 立的口径）。
   it("keeps the UA's own file-picker text off the composer", () => {
     const css = readFileSync(pathOf("../styles.css"), "utf8");
     const only = (selector: string): string => {
@@ -625,23 +628,14 @@ describe("theme tokens", () => {
     };
     expect(
       only(".image-file-input"),
-      ".image-file-input 不再把字号归零 —— UA 那行「未选择文件」会重新出现在界面上",
-    ).toMatch(/font-size:\s*0\s*(?:;|$)/);
-    const btn = only(".image-file-input::file-selector-button");
+      ".image-file-input 必须视觉隐藏（clip-path）而不是 display:none —— " +
+        "label 的点击激活依赖 input 还能被点",
+    ).toMatch(/clip-path:\s*inset/);
     expect(
-      btn,
-      "父级 font-size: 0 之后按钮必须自己声明字号；只写 `font: inherit` 会把 0 继承来，" +
-        "症状是按钮缩成零尺寸、附件的第三个入口点不着",
-    ).toMatch(/font-size:\s*[1-9]/);
-    // 反向断言。`::file-selector-button { content: "…" }` 在 2026-10-22 于发布产物里实测过：
-    // `getComputedStyle` 拿得到那串字，引擎却不拿它当按钮文案用（界面上仍是「选择文件」），
-    // 写进 `::-webkit-file-upload-button` 更被打回 `content: normal`。
-    // 留着这行等于让下一个读代码的人以为文案是我们定的 —— 要换文案得走 DOM
-    // （看得见的 `<label>` + 隐藏的 input），不是这里。
-    expect(
-      btn,
-      "`content` 改不动 file 按钮的文案（实测），写在这里是一行会骗人的死声明",
-    ).not.toMatch(/\bcontent\s*:/);
+      stripComments(css),
+      "UA 按钮已视觉隐藏，`::file-selector-button` 的皮肤规则不该再回来 —— " +
+        "「选择文件」那串文案改不动（2026-10-22 实测），换文案只能走 DOM",
+    ).not.toMatch(/file-selector-button/);
   });
 
   // ② `--text-muted` 落在四支底色上（页面、抬起层、输入框、代码底）都要过 WCAG AA 的 4.5:1。

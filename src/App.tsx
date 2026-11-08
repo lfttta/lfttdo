@@ -16,6 +16,7 @@ import {
   replay,
 } from "./state/reducer";
 import { writeThemeCache } from "./theme/cache";
+import { syncWindowChrome } from "./theme/windowChrome";
 import { applyTheme, resolveTheme } from "./theme/theme";
 import type {
   Decision,
@@ -82,6 +83,57 @@ function AppNotices({ notices }: { notices: string[] }) {
  * 重要到值得占一个设置键。
  */
 const MEMORY_TOAST_MS = 8_000;
+
+/**
+ * G35：上下文占用比（0–1）。`null` = 画不了条（还没有 usage 事件，或事件带的
+ * 净预算非法）—— 与状态栏同一取向：没数据就不渲染，不替没发生的事说话。
+ *
+ * 分母是 Usage 事件自带的 `budget`（session 侧按 `budget_tokens - reserve_output`
+ * 算好的净预算，与 context.rs 的压缩触发线同一条口径）；分子 `input_tokens` 是
+ * 模型**实报**的上次请求占用，比本地估算准。压缩发生后下一轮 usage 会明显回落，
+ * 条随之掉下来 ——「压缩过了」这件事不需要任何额外事件就能被看见。
+ */
+export function contextUsageRatio(
+  usage: { input: number; budget: number } | null,
+): number | null {
+  if (usage === null || usage.budget <= 0) return null;
+  return Math.min(1, usage.input / usage.budget);
+}
+
+/**
+ * G35 红线档位：`CTX_HOT` 与 `agent/context.rs` 里 `ContextConfig::default()`
+ * 的 `compact_threshold`（0.85）是**同一个数**——那边改阈值，这里的提示与配色要
+ * 一起改（纯展示分档，不参与判定，判定权永远在 Rust）。没做中间黄档：主题没有
+ * 警示黄 token（色值一律 `var(--token)`），而「该不该担心」本来就只有两态。
+ */
+const CTX_HOT = 0.85;
+
+function CtxMeter({ ratio }: { ratio: number | null }) {
+  if (ratio === null) return null;
+  const pct = Math.round(ratio * 100);
+  const hot = ratio > CTX_HOT;
+  return (
+    <span className="ctx-meter-wrap">
+      <span
+        className="ctx-meter"
+        data-testid="ctx-meter"
+        role="img"
+        aria-label={`上下文占用 ${pct}%`}
+      >
+        <span
+          className={hot ? "ctx-meter-fill hot" : "ctx-meter-fill"}
+          style={{ width: `${pct}%` }}
+        />
+      </span>
+      <span className="ctx-pct">{pct}%</span>
+      {hot ? (
+        <span className="ctx-hot-note" data-testid="ctx-hot-note">
+          上下文较满：下次发送将自动压缩较早的对话
+        </span>
+      ) : null}
+    </span>
+  );
+}
 
 export default function App() {
   const [rows, setRows] = useState<SessionRow[]>([]);
@@ -251,6 +303,9 @@ export default function App() {
         fontSize: v.font_size,
         accent: v.accent,
       });
+      // 标题栏的精确配色跟这里的主题应用同一时机：设置主题落了地，系统画的那条
+      // 标题栏才有的可对齐（色值从计算样式现读，见 windowChrome 的说明）。
+      syncWindowChrome();
       if (fellBack) notice(`未知主题「${v.theme}」，已回落到 noir`);
     },
     [notice],
@@ -419,6 +474,34 @@ export default function App() {
     },
     [notice, refresh],
   );
+
+  /**
+   * G39：重试最后一轮。链路固定三步，顺序不能换：
+   * ① `retry_last` 截断库里最后一轮，拿回用户原话块（None = 没有可重试的轮，静默）；
+   * ② 重放把界面拉回持久化真相 —— 被截掉的那轮从屏幕上消失（messages 是唯一真相源，
+   *    与 send 失败回滚是同一条不变量）；
+   * ③ 原话走**同一条** `send` 上线：乐观插入、失败回滚、自动改名、usage 全部免费复用，
+   *    重试不是第二条发送通路，只是替用户把同一句话再交一次。
+   * 每步 await 后都过代际/会话守卫：用户中途切走，迟到的那段不许改别的会话的界面。
+   * 原话块只有 text/image（真人发言的形状），cast 给 `SendBlock` 是安全的 ——
+   * 真有第三种块，重放早就把它渲染成卡片而不是把它留在这条链路里。
+   */
+  const retryLast = useCallback(async () => {
+    const sid = activeRef.current;
+    const gen = genRef.current;
+    if (sid === null) return;
+    try {
+      const blocks = await api.retryLastSession(sid);
+      if (blocks === null || activeRef.current !== sid || genRef.current !== gen) return;
+      const events = await api.replaySession(sid);
+      if (activeRef.current !== sid || genRef.current !== gen) return;
+      bufRef.current.flushNow();
+      setUi(replay(events));
+      await send(blocks as SendBlock[]);
+    } catch (e) {
+      notice(`重试失败：${String(e)}`);
+    }
+  }, [notice, send]);
 
   /**
    * R131：`respond` 的第二参名是 `requestId`，返回的 `bool` 意思是「pending 里确实有这一笔
@@ -666,11 +749,6 @@ export default function App() {
   // 身份必须稳定：面板的画像 effect 以它为依赖，漂一次就重拉一次。
   const loadProfile = useCallback(() => api.memoryProfile(), []);
 
-  const usageText =
-    ui.usage === null
-      ? "本轮 token：尚未回报"
-      : `本轮 token：输入 ${ui.usage.input} · 输出 ${ui.usage.output}`;
-
   const createSession = () => {
     void (async () => {
       try {
@@ -730,6 +808,17 @@ export default function App() {
             }
           })();
         }}
+        onExport={(id) => {
+          void (async () => {
+            try {
+              const path = await api.exportSession(id);
+              // null = 用户在保存对话框点了取消：是决定，不是事件，保持安静。
+              if (path !== null) notice(`已导出：${path}`);
+            } catch (e) {
+              notice(`导出失败：${String(e)}`);
+            }
+          })();
+        }}
       />
       <main className="pane">
         <AppNotices notices={appNotices} />
@@ -758,21 +847,31 @@ export default function App() {
               {sessionOutput?.output_dir ?? "正在读取…"}
             </button>
             <div className="workspace-actions">
-              <button type="button" onClick={() => void chooseWorkspace()}>
+              <button
+                type="button"
+                className="workspace-action"
+                onClick={() => void chooseWorkspace()}
+              >
                 选择文件夹
               </button>
-              <button type="button" onClick={() => void clearWorkspace()}>
+              <button
+                type="button"
+                className="workspace-action"
+                onClick={() => void clearWorkspace()}
+              >
                 清除
               </button>
             </div>
           </div>
         )}
         <MessageList
+          key={activeId ?? "none"}
           state={ui}
           onRespond={onRespond}
           onOpenLink={openLink}
           onRevealPath={onRevealPath}
           onAnswerQuestion={onQuestionAnswer}
+          onRetryLast={retryLast}
         />
         <Composer
           streaming={ui.streaming}
@@ -782,9 +881,15 @@ export default function App() {
           seed={composerSeed}
           skillsLoader={api.skillsList}
         />
-        <div className="statusbar" data-testid="usage">
-          {usageText}
-        </div>
+        {/* 没拿到 usage 事件就整行不渲染：常驻一句「尚未回报」是界面在替一个
+            还没发生的事件说话，而且那一行永远占着状态栏的位置。 */}
+        {ui.usage === null ? null : (
+          <div className="statusbar" data-testid="usage">
+            本轮 token：输入 {ui.usage.input} · 输出 {ui.usage.output}
+            {/* G35：占用条挂在 token 文本之后；分母随事件来，不依赖设置面板加载。 */}
+            <CtxMeter ratio={contextUsageRatio(ui.usage)} />
+          </div>
+        )}
       </main>
       {/* P1 轻提示。`role="status"` + `aria-live="polite"`：它**不该抢焦点**，
           也不该在用户正在打字时打断他，只排到下一句话之后读一次。

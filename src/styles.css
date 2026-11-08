@@ -145,8 +145,13 @@ a:hover {
 
 /* 行尾那两个动作：静止态不描边、不给底、字号降一档，悬停/按下时才由基座那两条
    `button:hover` / `button:active` 长出边界。原来三个控件全都带边框+阴影，
-   一行看过去是三个并排的盒子，读不出「左边那个是会话名，右边这两个是动作」。 */
+   一行看过去是三个并排的盒子，读不出「左边那个是会话名，右边这两个是动作」。
+   进一步只在悬停这一行时现身：一列会话里每行常驻两枚文字按钮是噪音，
+   读三行就读了六遍「重命名 删除」。`focus-within` 是键盘的那条腿 —— Tab 走进
+   这一行时按钮必须可见，不能只认鼠标。桌面 WebView 没有「无悬停」的触屏问题；
+   屏幕阅读器读的是 DOM，opacity 不把按钮从可达性树里摘掉。 */
 .session-rename,
+.session-export,
 .session-delete {
   padding: 2px 8px;
   border-color: transparent;
@@ -154,6 +159,17 @@ a:hover {
   box-shadow: none;
   color: var(--text-muted);
   font-size: 0.8em;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.session-item:hover .session-rename,
+.session-item:hover .session-export,
+.session-item:hover .session-delete,
+.session-item:focus-within .session-rename,
+.session-item:focus-within .session-export,
+.session-item:focus-within .session-delete {
+  opacity: 1;
 }
 
 .rename-form {
@@ -168,6 +184,42 @@ a:hover {
 .rename-form input {
   flex: 1 1 auto;
   min-width: 0;
+}
+
+/* 删除的两段式确认条（Sidebar 的 `armedId`）：与重命名表单同一布局 —— 占满一整行，
+   不和标题/动作挤同一格。文字用 `--danger`：这是破坏性操作的确认，不是普通提示；
+   「确认删除」描危险色边，和旁边灰调的「取消」拉开主次。
+   三件套整体降一档字号、按钮收窄内边距：240px 的侧栏里按控件原尺寸排是 247px，
+   「取消」会被挤下第二行，孤零零一枚按钮看着像布局事故。 */
+.delete-confirm {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.delete-confirm-text {
+  color: var(--danger);
+  font-size: 0.8em;
+}
+
+.session-delete-armed,
+.session-delete-cancel {
+  padding: 2px 8px;
+  font-size: 0.8em;
+}
+
+.session-delete-armed {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.session-delete-cancel {
+  border-color: transparent;
+  background-color: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
 }
 
 /* ==== 主面板 ==== */
@@ -202,6 +254,16 @@ a:hover {
 .workspace-actions {
   display: flex;
   gap: 6px;
+}
+
+/* 顶栏那两个动作是次要操作（改工作文件夹不是每轮都做的事）：字号与内边距各降一档，
+   不再和「发送」同规格 —— 原来整条栏看着像三个并列的主操作，路径反而最不显眼。
+   走类名而不是 `.workspace-actions button`：裸 `button` 结尾的选择器会被
+   `no-descending-specificity` 钉住（必须排在基座那组伪类之前），类名没有这个纠缠，
+   `.sidebar-action` 同一个先例。 */
+.workspace-action {
+  padding: 2px 8px;
+  font-size: 0.85em;
 }
 
 .message-list {
@@ -306,6 +368,9 @@ a:hover {
   gap: 8px;
   line-height: 1.6;
   overflow-wrap: anywhere;
+
+  /* 复制 chip 的定位基准：绝对定位在气泡右上角，不参与布局。 */
+  position: relative;
 }
 
 /* 四角同圆角时，一列气泡看着像一列同规格的盒子；把靠近说话人那一侧的下/上角收到
@@ -334,6 +399,48 @@ a:hover {
 .bubble-assistant[data-streaming]:empty::after {
   content: "…";
   color: var(--text-muted);
+}
+
+/* 等首字的「…」加一层呼吸：静态的省略号读不出「还在跑」，冷启动实测要等 5~10 秒，
+   动与不动在这段时间里是「活着」和「卡死了」的区别。包装进 no-preference：
+   系统开了「减少动态效果」时动画是装饰、也是负担，退回静态。 */
+@media (prefers-reduced-motion: no-preference) {
+  .bubble-assistant[data-streaming]:empty::after {
+    animation: wait-breathe 0.9s ease-in-out infinite alternate;
+  }
+}
+
+@keyframes wait-breathe {
+  from {
+    opacity: 0.25;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+/* ==== 复制 chip ====
+   两个落点共用一枚：assistant 气泡右上角（整条回答）、代码块右上角（这段代码）。
+   复制是次要动作，静止态透明、悬停容器或键盘聚焦时才现身；绝对定位不占布局，
+   气泡的高度、代码块的滚动都不受它影响。specificity 升序排：裸 → focus → hover。 */
+.copy-chip {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 2px 8px;
+  font-size: 0.8em;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.copy-chip:focus-visible {
+  opacity: 1;
+}
+
+.bubble:hover .copy-chip,
+.md-code:hover .copy-chip {
+  opacity: 1;
 }
 
 /* 流式进行中的那一块：纯文本，保留换行，不解析半截 Markdown（要求 2）。 */
@@ -375,6 +482,12 @@ a:hover {
 .md pre {
   padding: 12px 16px;
   overflow-x: auto;
+}
+
+/* 代码块的包装层（MessageBubble 的 CodeBlock）：只为给右上角的复制 chip 当定位基准。
+   `pre` 本体一动不动 —— 内边距、横向滚动、等宽字号都还是上面那两条的。 */
+.md-code {
+  position: relative;
 }
 
 .md blockquote {
@@ -601,6 +714,77 @@ button.path-chip:disabled {
   font-size: 0.85em;
 }
 
+/* G35 上下文占用条：宽度由 TS 按 min(100, used/budget) 内联给出，分母口径 =
+   budget_tokens - reserve_output（与 context.rs 的压缩触发线同源，见 App.tsx）。
+   正常态走 --accent，越过压缩线（0.85）整体换 --danger：主题里没有警示黄 token，
+   且「该不该担心」只有两态，不值得为它发明第三种颜色。 */
+.ctx-meter-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 12px;
+  vertical-align: middle;
+}
+
+.ctx-meter {
+  display: inline-block;
+  width: 120px;
+  height: 4px;
+  border-radius: 2px;
+  background-color: var(--border);
+  overflow: hidden;
+}
+
+.ctx-meter-fill {
+  display: block;
+  height: 100%;
+  background-color: var(--accent);
+  transition: width 0.3s ease;
+}
+
+.ctx-meter-fill.hot {
+  background-color: var(--danger);
+}
+
+.ctx-pct {
+  font-variant-numeric: tabular-nums;
+}
+
+.ctx-hot-note {
+  color: var(--danger);
+}
+
+/* G42 历史折叠的「展开更早的 N 条」：贴着通知条下方居中，弱化为一条可点的
+   文本钮 —— 它是翻旧账的入口，不该和气泡抢视觉。 */
+.turns-expand {
+  display: block;
+  margin: 8px auto 0;
+  padding: 2px 10px;
+  border-color: transparent;
+  background-color: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
+/* G39 重试按钮：气泡内正常流的最后一行（不与右上角的复制 chip 抢绝对定位），
+   弱化为文本钮 —— 重试是「对这轮答案不满意」的出口，不是主操作。 */
+.bubble-retry {
+  display: inline-flex;
+  align-self: flex-start;
+  margin-top: 6px;
+  padding: 2px 8px;
+  border-color: transparent;
+  background-color: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  font-size: 0.8em;
+}
+
+.bubble-retry:hover {
+  color: var(--accent);
+}
+
 /* 卡片和气泡不是控件，基座那一节管不到，阴影在这里补上。
    控件（含 `.composer-input`）的阴影已在基座里，重复写一遍等于同一个属性两个来源。
    两块 surface 走两层而不是单层 `0 2px 2px`：第一层贴着边收住轮廓（1px，几乎只是让
@@ -718,43 +902,55 @@ button.path-chip:disabled {
   color: var(--text-primary);
 }
 
-/* 这个控件在基座那一节里是按「控件」待遇画的（边框、底色、阴影）。整条规则现在把这些
-   一层层撤掉，落到最后一行只剩那枚 UA 按钮 —— 因为 UA 按钮自己就是可见控件，外面那层壳
-   是多余的一圈。宽度预算仍在：不写 `width: fit-content`，它作为 `.image-strip`（flex 列）
-   的子项会被拉满整行宽，按钮右边拖着一条空到底的底色带。
-   `font-size: 0`：UA 除了那枚按钮还自己画一行「未选择文件」，那**不是 DOM 节点**，
-   没有任何选择器点得着它 —— 唯一的入口是让承载它的控件字号归零。同一处选完文件后会换成
-   文件名，也一起没了；不心疼：`.image-name`（ImageStrip.tsx:71）本来就逐张把名字渲染成 DOM
-   文本，比 UA 那一行更完整（多张图各有一行，UA 只留最后一次选择的那个）。
-   外壳那圈边框/底色/阴影跟着一起撤：文案没了以后，那层壳就是「一个套着按钮的空盒子」。 */
-.image-file-input {
+/* 第三个入口的可见面是「添加图片」这枚 chip（ImageStrip 的 label + 视觉隐藏 input）。
+   2026-11-08 之前是给原生 UA 按钮做皮肤：font-size: 0 吃掉「未选择文件」那行画不着的
+   UA 文案、再给 `::file-selector-button` 逐条补样式 —— 但「选择文件」那串按钮文字
+   终究改不动（content 在发布产物里实测打不进去），它一直是输入区里唯一一块系统
+   默认模板的残留。现在可见面是普通 DOM，样式与「通用控件」基座同规格
+   （描边/底色/投影），只是字号降一档：它是次要动作。 */
+.image-file-entry {
   width: fit-content;
-  max-width: 100%;
-  padding: 0;
-  border: 0;
-  font-size: 0;
-  background-color: transparent;
-  box-shadow: none;
 }
 
-/* 那枚按钮是 UA 画的，`::file-selector-button` 是唯一入口：颜色一律走 token（R207）。
-   字号**必须自己写**：`font: inherit` 会把上面那个 0 继承进来，症状是按钮缩成零尺寸、
-   附件的第三个入口点不着 —— 这两条声明是成对的，`tokens.test.ts` 那条闸钉的就是这个对。
-   单位取 `rem` 不取 `em`：父级字号是 0，`em` 会跟着塌成 0。
-   **文案改不掉**（2026-10-22 在发布产物里实测）：`::file-selector-button { content: "添加图片" }`
-   在 `getComputedStyle` 里拿得到那串字，但引擎不拿它当按钮文案用，界面上仍是「选择文件」；
-   写进 `::-webkit-file-upload-button` 更直接被打回 `content: normal`。⇒ 不许再加 `content`
-   装样子，想换文案只能换成「看得见的 `<label>` + 隐藏 input」那一类 DOM 改动。 */
-.image-file-input::file-selector-button {
+.image-file-button {
+  display: inline-block;
   padding: 4px 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   background-color: var(--bg-raised);
-  font-family: inherit;
-  font-size: 1rem;
+  font-size: 0.9em;
   box-shadow: 0 1px 2px var(--shadow);
   cursor: pointer;
+}
+
+.image-file-entry:hover .image-file-button {
+  border-color: var(--accent);
+}
+
+.image-file-entry:active .image-file-button {
+  border-color: var(--accent);
+  background-color: var(--bg-surface);
+}
+
+/* input 本体视觉隐藏但留在可达性树里：`data-testid="file-input"` 的 change 合同
+   （测试与「清 value 重选同一文件」）一字未动；键盘 Tab 到它时焦点环画在 label
+   的 chip 上（`:has` 在 WebView2 的 Chromium 里可用）。1×1 + clip-path 是标准
+   的「视觉隐藏」手法：不能 display:none —— 那样 label 点击就点不开选择器了。 */
+.image-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  clip-path: inset(50%);
+  overflow: hidden;
+}
+
+.image-file-entry:has(.image-file-input:focus-visible) .image-file-button {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* ==== 设置面板（T45） ==== */

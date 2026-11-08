@@ -9,6 +9,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import { seedFromCache } from "./theme/cache";
+import { syncWindowChrome } from "./theme/windowChrome";
 
 // T44（裁定 2 重写此段；旧版断言「主题只有一个来源」从这一刻起不再成立）：
 // 首帧前同步读一次主题**缓存**。R169 当年删掉的是
@@ -22,6 +23,10 @@ import { seedFromCache } from "./theme/cache";
 // 权威仍是 `App` 里那次 `settings_get`：它回来后**无条件覆盖**缓存与界面，
 // 磁盘上的设置永远赢过首帧播种的那一份。
 seedFromCache(document.documentElement);
+// 标题栏从**第一帧**就不是系统灰：播种的主题落了地，立刻把 DWM 那条标题栏
+// 染成同一色（权威的 settings_get 回来后 App 里还会再同步一次，两处共用
+// windowChrome 这一份实现）。
+syncWindowChrome();
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

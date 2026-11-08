@@ -26,6 +26,10 @@ const h = vi.hoisted(() => {
     skillsSetEnabled: vi.fn(),
     revealPath: vi.fn(),
     pickFolder: vi.fn(async (): Promise<string | null> => null),
+    // G38/G39：缺这两支的话，任何碰到「导出/重试」的用例会在 mock 工厂上抛
+    // 「not a function」，把真正的断言失败淹掉 —— 与上面 flushMemory 同一条理由。
+    exportSession: vi.fn(async (): Promise<string | null> => null),
+    retryLastSession: vi.fn(async (): Promise<unknown[] | null> => null),
     sessionOutputView: vi.fn(async () => ({
       workspace: null,
       output_dir: "C:\\out\\session",
@@ -136,6 +140,8 @@ beforeEach(() => {
   h.skillsList.mockReset().mockResolvedValue({ root: "", skills: [] });
   h.skillsOpenFolder.mockReset().mockResolvedValue(undefined);
   h.skillsSetEnabled.mockReset().mockResolvedValue(undefined);
+  h.exportSession.mockReset().mockResolvedValue(null);
+  h.retryLastSession.mockReset().mockResolvedValue(null);
   h.replaySession.mockReset().mockResolvedValue([]);
   h.sessions.mockReset().mockResolvedValue([row("B", 2)]);
   h.createSession.mockReset().mockResolvedValue("N");
@@ -670,11 +676,99 @@ describe("App", () => {
     render(<App />);
     await settled();
     act(() =>
-      h.emit("B", { t: "usage", input_tokens: 120, output_tokens: 34 }),
+      h.emit("B", { t: "usage", input_tokens: 120, output_tokens: 34, budget: 27_904 }),
     );
     // 钉整句而不是「两个数字都在」：只查 in/toMatch 的话输入/输出对调照样绿（实测过一次）。
     expect(await screen.findByTestId("usage")).toHaveTextContent(
       "本轮 token：输入 120 · 输出 34",
+    );
+  });
+
+  // 2026-11-08 视觉降噪：没拿到 usage 事件就整行不渲染 —— 常驻一句「尚未回报」
+  // 是界面在替一个还没发生的事件说话。有数据的那一半由上一条用例钉着。
+  it("hides the token line until a usage event arrives", async () => {
+    render(<App />);
+    await settled();
+    expect(screen.queryByTestId("usage")).toBeNull();
+  });
+
+  // G35：usage 一到条就出现 —— 分母是事件自带的净预算（mock 32000-4096=27904，
+  // 与 Rust 压缩触发线同口径），不依赖设置面板是否打开过。
+  it("G35: shows the context meter as soon as a usage event arrives", async () => {
+    render(<App />);
+    await settled();
+    // 12000 / 27904 ≈ 43%：正常档，不应出现压缩提示。
+    act(() =>
+      h.emit("B", { t: "usage", input_tokens: 12_000, output_tokens: 10, budget: 27_904 }),
+    );
+    const meter = await screen.findByTestId("ctx-meter");
+    expect(meter).toHaveAttribute("aria-label", "上下文占用 43%");
+    expect(screen.queryByTestId("ctx-hot-note")).toBeNull();
+  });
+
+  // G35：越过 0.85 压缩线（与 context.rs 的 compact_threshold 同源）换红并点名
+  // 「将自动压缩」—— 用户看见的正是 compact_before_turn 接下来要做的事。
+  it("G35: flags the compression note past the 85% line", async () => {
+    render(<App />);
+    await settled();
+    // 24000 / 27904 ≈ 86%：刚过线。断言走 aria-label（pct 文本在 meter 外面的
+    // .ctx-pct 里，meter 元素自身只有图形）。
+    act(() =>
+      h.emit("B", { t: "usage", input_tokens: 24_000, output_tokens: 10, budget: 27_904 }),
+    );
+    expect(await screen.findByTestId("ctx-meter")).toHaveAttribute(
+      "aria-label",
+      "上下文占用 86%",
+    );
+    expect(await screen.findByTestId("ctx-hot-note")).toHaveTextContent(
+      "下次发送将自动压缩",
+    );
+  });
+
+  // G35：条永远不早于 token 文本出现 —— 没有 usage 就没有条，
+  // usage 一到文本与条同现（降级的是条，不是状态行）。
+  it("G35: the meter never appears before the first usage event", async () => {
+    render(<App />);
+    await settled();
+    expect(screen.queryByTestId("usage")).toBeNull();
+    expect(screen.queryByTestId("ctx-meter")).toBeNull();
+    act(() =>
+      h.emit("B", { t: "usage", input_tokens: 12_000, output_tokens: 10, budget: 27_904 }),
+    );
+    expect(await screen.findByTestId("usage")).toHaveTextContent(
+      "本轮 token：输入 12000 · 输出 10",
+    );
+    expect(screen.getByTestId("ctx-meter")).toBeInTheDocument();
+  });
+
+  // G39 集成：点「重试这一轮」= 截断 → 重放 → 原话重发，三步都在同一条链上。
+  // 截断与重放由 mock 承担，这条钉的是 **App 的义务**：原话原样交给 sendMessage、
+  // 中途刷新过一次重放（把被截的轮从界面拉掉）。
+  it("G39: retrying the last turn truncates, replays, and resends the original words", async () => {
+    render(<App />);
+    await settled();
+    // 造一个已经完成的 assistant 轮（重试钮只在收尾后出现）。
+    act(() => {
+      h.emit("B", { t: "turn_start", turn: 1 });
+      h.emit("B", { t: "text_delta", text: "第一次的回答" });
+      h.emit("B", { t: "done", stop_reason: "end_turn" });
+    });
+    expect(await screen.findByTestId("bubble-retry")).toBeInTheDocument();
+    const replayCallsBefore = h.replaySession.mock.calls.length;
+
+    h.retryLastSession.mockResolvedValue([{ type: "text", text: "最初的问题" }]);
+    fireEvent.click(screen.getByTestId("bubble-retry"));
+
+    expect(h.retryLastSession).toHaveBeenCalledWith("B");
+    // 截断成功后重放被再拉一次（2 = 启动那一次 + 重试这一次）。
+    await waitFor(() =>
+      expect(h.replaySession.mock.calls.length).toBeGreaterThan(replayCallsBefore),
+    );
+    // 原话原样走同一条 sendMessage（不是第二条发送通路）。
+    await waitFor(() =>
+      expect(h.sendMessage).toHaveBeenCalledWith("B", [
+        { type: "text", text: "最初的问题" },
+      ]),
     );
   });
 

@@ -797,7 +797,12 @@ impl AgentSession {
                                 input_tokens as f64 / self.last_est_input as f64,
                             );
                         }
-                        self.deps.sink.emit(AgentEvent::Usage { input_tokens, output_tokens });
+                        // G35：净预算随每条 Usage 上线（口径 = budget - reserve，与
+                        // context.rs 的压缩触发线同源）—— 前端画占用条时不用再读设置。
+                        let cfg = self.deps.context.config();
+                        let budget = cfg.budget_tokens.saturating_sub(cfg.reserve_output);
+                        self.deps.sink
+                            .emit(AgentEvent::Usage { input_tokens, output_tokens, budget });
                     }
                     Some(Ok(d)) => {
                         if let Some(text) = acc.apply(d) {
@@ -1110,6 +1115,7 @@ mod tests {
                     AgentEvent::Usage {
                         input_tokens,
                         output_tokens,
+                        ..
                     } => Some((input_tokens, output_tokens)),
                     _ => None,
                 })

@@ -67,6 +67,10 @@ pub enum AgentEvent {
     Usage {
         input_tokens: u32,
         output_tokens: u32,
+        /// G35：净预算 = `budget_tokens - reserve_output`（context.rs 的压缩触发线
+        /// 同一条口径，Rust 侧算好再上线 —— 前端不做减法，预算只有一个真相）。
+        /// 每次请求都可能因设置变更而不同，所以它跟着每条 Usage 走，而不是落在设置里。
+        budget: u32,
     },
     ContextCompacted {
         dropped: usize,
@@ -161,6 +165,21 @@ pub enum StopReason {
     MaxTurns,
     Interrupted,
     Error,
+}
+
+/// G36：这个事件是不是「需要人回到窗口来处理」。判定住事件层（可脱离 Tauri 单测），
+/// 动作（失焦时闪任务栏）住装配处的闭包 —— 两层各管各的，events.rs 因此不认识窗口。
+/// 规则只有两类：
+/// * **要人决策的**：权限请求（不批，轮次就停在那儿）、模型提问（不答，轮次同样停）；
+/// * **回合收尾**：任务做完了 / 撞上限了 / 出错了 —— 用户切走时该知道。
+///
+/// `Done(Interrupted)` 唯独不算：停止是用户自己按的，没有人需要被拉回来看「你按了停止」。
+pub fn needs_attention(e: &AgentEvent) -> bool {
+    match e {
+        AgentEvent::PermissionRequest { .. } | AgentEvent::Question { .. } => true,
+        AgentEvent::Done { stop_reason } => *stop_reason != StopReason::Interrupted,
+        _ => false,
+    }
 }
 
 /// G26：工作流步骤的三态（`WorkflowStep.status`）。线上小写（`lowercase`），
@@ -270,6 +289,48 @@ impl<'de> Deserialize<'de> for Decision {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // G36：注意力判定的两条正面、一条用户自按的豁免、其余事件一律不打扰。
+    #[test]
+    fn attention_fires_for_permission_question_and_finish_but_not_user_interrupt() {
+        let perm = AgentEvent::PermissionRequest {
+            id: "p1".into(),
+            call: ToolCallView {
+                id: "c1".into(),
+                name: "shell".into(),
+                input: serde_json::json!({"cmd": "dir"}),
+                risk: Risk::Exec,
+            },
+            risk: Risk::Exec,
+        };
+        assert!(needs_attention(&perm));
+        assert!(needs_attention(&AgentEvent::Question {
+            id: "q1".into(),
+            question: "选哪个".into(),
+            options: vec!["甲".into()],
+        }));
+        for reason in [StopReason::EndTurn, StopReason::MaxTurns, StopReason::Error] {
+            assert!(
+                needs_attention(&AgentEvent::Done {
+                    stop_reason: reason
+                }),
+                "{reason:?} 的收尾应该提醒"
+            );
+        }
+        // 用户自己按的停止：他就在窗口边上了，闪任务栏是骚扰。
+        assert!(!needs_attention(&AgentEvent::Done {
+            stop_reason: StopReason::Interrupted,
+        }));
+        // 流式文本与 usage 是高频噪声，永远不该触发注意力。
+        assert!(!needs_attention(&AgentEvent::TextDelta {
+            text: "字".into()
+        }));
+        assert!(!needs_attention(&AgentEvent::Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            budget: 27_904,
+        }));
+    }
 
     #[test]
     fn agent_event_uses_t_as_tag_and_snake_case() {
@@ -461,6 +522,7 @@ mod tests {
             AgentEvent::Usage {
                 input_tokens: 0,
                 output_tokens: 0,
+                budget: 0,
             },
             AgentEvent::ContextCompacted {
                 dropped: 0,
@@ -670,8 +732,10 @@ mod tests {
                 AgentEvent::Usage {
                     input_tokens: 900,
                     output_tokens: 21,
+                    budget: 27_904,
                 },
-                json!({ "t": "usage", "input_tokens": 900, "output_tokens": 21 }),
+                json!({ "t": "usage", "input_tokens": 900, "output_tokens": 21,
+                        "budget": 27_904 }),
             ),
             (
                 AgentEvent::ContextCompacted {

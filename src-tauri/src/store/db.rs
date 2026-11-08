@@ -39,7 +39,9 @@ const SCHEMA_VERSION: i64 = 5;
 
 /// 会话标题上限（字符）。这是**标题**规则（40），不是工具输出预览（200，见
 /// `ToolOutput::preview()`）：两个槽位、各自一处计算，别让它们互相「复用」出一个第三种形状。
-const TITLE_CHARS: usize = 40;
+/// 标题字数上限。G37 起 `ipc.rs` 的模型起名路径也用它截断——标题的长度是「标题
+/// 字段」的属性，两处写同一份数字就是第二份真相（R77），所以提为 pub。
+pub const TITLE_CHARS: usize = 40;
 
 /// 建表语句。`ON DELETE CASCADE` 是 `delete_session` 只发一条 DELETE 的前提（R73）。
 /// 那句 `PRAGMA foreign_keys = ON` 在本仓库当前**是重复的**：`libsqlite3-sys` 的 bundled
@@ -361,6 +363,64 @@ impl Db {
             .map(|m| m.text_of())
             .find(|t| !t.is_empty())
             .map(|t| crate::text::truncate_display(&t, TITLE_CHARS)))
+    }
+
+    /// G39：「重试最后一轮」的截断。从尾部找最后一条**真人**发言（判别与
+    /// [`Self::latest_user_message`] 完全同一条线：`is_tool_row` 挡工具结果行、
+    /// `is_tool_image_followup` 挡图片跟进行 —— 少一道就会把辅助行当成发言起点，
+    /// 删错用户的原话），把它与它之后的**所有行**在一个事务里删掉，返回它的原文
+    /// blocks 供调用方原样重发。
+    ///
+    /// 删除按 `id >= 起点行` 走（行序即 id 序，[`Self::messages`] 的同一条口径）。
+    /// 压缩备注（`role='system'`）的物理 id 总在其后的真人行之前（备注在发送前落库），
+    /// 所以重试天然不会删到摘要；`updated_at` 随事务刷新 —— 「刚动过」的排序语义
+    /// 与 `insert_message_row` 一致。没有可重试的轮（空会话 / 只剩备注与辅助行）
+    /// 返回 `Ok(None)` 且库一字不动，调用方不用预判。
+    pub fn truncate_last_user_turn(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Vec<ContentBlock>>, rusqlite::Error> {
+        let mut c = self.lock();
+        let tx = c.transaction()?;
+        let mut st = tx.prepare(
+            "SELECT id, blocks_json FROM messages \
+             WHERE session_id=?1 AND role='user' ORDER BY id DESC",
+        )?;
+        let rows = st
+            .query_map(params![session_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(st);
+        // 倒序找的第一条真人行就是最后一轮的起点；辅助行（工具结果/图片跟进）
+        // 跳过但不删 —— 删除范围从真人行起，它们天然落在范围里被一并清掉。
+        let mut target: Option<(i64, Vec<ContentBlock>)> = None;
+        for (id, json) in rows {
+            let probe = Message {
+                role: Role::User,
+                blocks: decode_blocks(&json, 1)?,
+            };
+            // 与 latest_user_message 同一条三道判别：role 列已在 SQL 里钉死 user，
+            // 这里只剩工具结果行与图片跟进门两道。
+            if !is_tool_row(&probe) && !probe.is_tool_image_followup() {
+                target = Some((id, probe.blocks));
+                break;
+            }
+        }
+        let Some((cut_id, blocks)) = target else {
+            // 没有可重试的轮：空事务随 drop 回滚，库保持原样。
+            return Ok(None);
+        };
+        tx.execute(
+            "DELETE FROM messages WHERE session_id=?1 AND id>=?2",
+            params![session_id, cut_id],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET updated_at=?2 WHERE id=?1",
+            params![session_id, Db::now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(Some(blocks))
     }
 }
 
@@ -691,6 +751,90 @@ mod tests {
     /// 同一个名字，查表给 `Write`（Plan B 的 `write_file` 就是这样）。
     fn write_of(_name: &str) -> Risk {
         Risk::Write
+    }
+
+    // ───────────────────── G39：truncate_last_user_turn ─────────────────────
+
+    // 两轮纯文本：截掉最后一整轮（u2+a2），第一轮两行原样保留，返回的是 u2 的原文块。
+    #[test]
+    fn truncate_cuts_the_last_turn_and_hands_back_its_user_blocks() {
+        let (_d, db) = tmpdb();
+        let sid = db.create_session("两轮").unwrap();
+        db.append_message(&sid, &user_text("第一问")).unwrap();
+        db.append_message(&sid, &assistant(vec![text_block("第一答")]))
+            .unwrap();
+        db.append_message(&sid, &user_text("第二问")).unwrap();
+        db.append_message(&sid, &assistant(vec![text_block("第二答")]))
+            .unwrap();
+
+        let blocks = db
+            .truncate_last_user_turn(&sid)
+            .unwrap()
+            .expect("有轮可重试");
+        assert_eq!(blocks, vec![text_block("第二问")]);
+        let left = db.messages(&sid).unwrap();
+        assert_eq!(left.len(), 2, "只该剩第一轮的两行:{left:?}");
+        assert_eq!(left[0].text_of(), "第一问");
+        assert_eq!(left[1].text_of(), "第一答");
+    }
+
+    // 工具结果行 role 同为 user（R69/R75），不算发言起点：最后一轮带工具时，
+    // 重试的起点必须再往前找 —— 找到真人行后，工具行随删除范围一并清掉。
+    #[test]
+    fn truncate_skips_tool_rows_and_clears_them_with_the_range() {
+        let (_d, db) = tmpdb();
+        let sid = db.create_session("带工具").unwrap();
+        db.append_message(&sid, &user_text("看看目录")).unwrap();
+        // 工具结果行（role=User，靠块种类判别）。
+        db.append_message(
+            &sid,
+            &Message::tool("c1", ToolOutput::text("main.rs"), false),
+        )
+        .unwrap();
+        db.append_message(&sid, &assistant(vec![text_block("有 main.rs")]))
+            .unwrap();
+
+        let blocks = db
+            .truncate_last_user_turn(&sid)
+            .unwrap()
+            .expect("真人行在工具行之前");
+        assert_eq!(blocks, vec![text_block("看看目录")]);
+        assert!(db.messages(&sid).unwrap().is_empty(), "唯一一轮整体消失");
+    }
+
+    // 没有真人行（只剩工具结果行 / 空会话）⇒ Ok(None) 且库一字不动。
+    #[test]
+    fn truncate_returns_none_and_touches_nothing_without_a_real_turn() {
+        let (_d, db) = tmpdb();
+        let sid = db.create_session("空").unwrap();
+        assert!(db.truncate_last_user_turn(&sid).unwrap().is_none());
+        db.append_message(
+            &sid,
+            &Message::tool("c1", ToolOutput::text("孤儿结果"), false),
+        )
+        .unwrap();
+        assert!(db.truncate_last_user_turn(&sid).unwrap().is_none());
+        assert_eq!(db.messages(&sid).unwrap().len(), 1, "工具行原样保留");
+    }
+
+    // 压缩备注（role=system）物理 id 在其后真人行之前 ⇒ 重试不删摘要。
+    #[test]
+    fn truncate_keeps_the_compaction_note_before_the_cut() {
+        let (_d, db) = tmpdb();
+        let sid = db.create_session("带备注").unwrap();
+        db.append_message(&sid, &user_text("早期内容")).unwrap();
+        db.append_message(&sid, &Message::system_note("早期对话摘要：早期内容"))
+            .unwrap();
+        db.append_message(&sid, &user_text("最新一问")).unwrap();
+
+        let blocks = db
+            .truncate_last_user_turn(&sid)
+            .unwrap()
+            .expect("有轮可重试");
+        assert_eq!(blocks, vec![text_block("最新一问")]);
+        let left = db.messages(&sid).unwrap();
+        assert_eq!(left.len(), 2, "第一问与摘要备注都该保留:{left:?}");
+        assert_eq!(left[1].text_of(), "早期对话摘要：早期内容");
     }
 
     /// 事件的线上 `t` 标签序列 —— 断言写的是前端实际读到的字节，不是 Rust 变体名。

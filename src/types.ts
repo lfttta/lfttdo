@@ -443,7 +443,16 @@ export type AgentEvent =
       preview: string;
       images: ToolImage[];
     }
-  | { t: "usage"; input_tokens: number; output_tokens: number }
+  | {
+      t: "usage";
+      input_tokens: number;
+      output_tokens: number;
+      /**
+       * G35：净预算（budget_tokens - reserve_output），Rust 侧算好随每条 Usage
+       * 上线 —— 前端不做减法，预算口径只有 Rust 一份真相。
+       */
+      budget: number;
+    }
   | { t: "context_compacted"; dropped: number; summary_chars: number }
   /**
    * P1：这一轮**新记住了几条**（events.rs 的 `MemorySaved { count }`）。它是「记忆在
@@ -604,7 +613,7 @@ export interface UiState {
    */
   streaming: boolean;
   /** 瞬时事件，重放路径不会重建它（R114）。 */
-  usage: { input: number; output: number } | null;
+  usage: { input: number; output: number; budget: number } | null;
   /**
    * P1：最近一次 `memory_saved` 的条数与一个**本地递增序号** `at`。
    *

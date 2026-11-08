@@ -180,6 +180,76 @@ pub async fn collect_summary(
     }
 }
 
+// ───────────────────────── G37：会话标题生成 ─────────────────────────
+// 与摘要同族的一次辅助模型调用：同一套清洗（auxiliary_source）、同一条收流
+// （drain_text_stream）、同样不带温度（起名是收敛任务，不是创作任务）。
+// 落库与触发时机归 ipc.rs 的 run_turn 收尾段；这里只负责「把一批消息换成一个
+// 标题候选，或者诚实地报错」。
+
+/// 起名指令。要点与摘要同源：只压缩已给内容、不补充；「只输出标题本身」是在收口
+/// 模型最爱加的「标题：」「好的，」类前缀——前缀留在标题里比摘要占位符难看得多。
+pub const TITLE_INSTRUCTION: &str = "请为以上对话生成一个会话标题：6 到 12 个字，概括用户的核心意图；\
+只输出标题文本本身，不要引号、不要句号、不要任何解释或「标题：」之类的前缀。用中文。";
+
+/// 组装起名请求。输入清洗复用 [`auxiliary_source`]：起名只需要文本（图片降级、
+/// 工具块丢弃——与摘要同一条理由，工具输出是数据不是用户的陈述）。
+pub fn title_request(src: &[Message]) -> ChatRequest {
+    let mut msgs = vec![Message::system_note(TITLE_INSTRUCTION)];
+    msgs.extend(auxiliary_source(src));
+    ChatRequest {
+        messages: msgs,
+        // 空工具声明：未声明的工具不可能被调用（R43 的教训，与摘要同一道闸）。
+        tools: vec![],
+        temperature: None,
+    }
+}
+
+/// 清洗模型吐回的标题：剥一层成对引号/书名号、折叠换行、去首尾空白。
+///
+/// **不截断**——长度上限是「标题字段」的属性（`store::db::TITLE_CHARS`），不是起名
+/// 调用的属性；第二份字面量就是第二份真相（R77）。截断归调用方。
+///
+/// 不对称的引号（只有头或只有尾）不剥：剥一半比不剥更难看，且「模型连引号都
+/// 只吐一半」这种输入本身就不值得猜测意图。空引号 / 纯空白清洗后是空串，
+/// 调用方据此走降级路径。
+pub fn sanitize_title(raw: &str) -> String {
+    let trimmed = raw.trim();
+    const PAIRS: [(char, char); 4] = [
+        ('\"', '\"'),
+        ('\u{201c}', '\u{201d}'),
+        ('「', '」'),
+        ('《', '》'),
+    ];
+    // 首尾各消费一个字符再取剩余：按字符边界剥壳，字节索引会在多字节字符中间切开。
+    let unwrapped = || {
+        let mut chars = trimmed.chars();
+        let first = chars.next()?;
+        let last = chars.next_back()?;
+        PAIRS
+            .iter()
+            .find(|(open, close)| first == *open && last == *close)
+            .map(|_| chars.as_str())
+    };
+    let unwrapped = unwrapped().unwrap_or(trimmed);
+    unwrapped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 收标题流。合同与 [`collect_summary`] 同构（同一条 `drain_text_stream`）：
+/// 空文本是 `Err`（落一个空标题等于把「新对话」换成更糟的什么都不是）；
+/// 取消是 `Err` 且调用方按令牌区分——用户按停后保持原标题，不算失败。
+pub async fn collect_title(
+    model: &dyn ModelProvider,
+    req: ChatRequest,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
+    match drain_text_stream(model, req, cancel).await {
+        TextStreamOutcome::Done(text) if !text.trim().is_empty() => Ok(text),
+        TextStreamOutcome::Done(_) => Err("标题调用返回了空文本".to_string()),
+        TextStreamOutcome::Cancelled => Err("标题已取消，保持原标题".to_string()),
+        TextStreamOutcome::Failed(message) => Err(format!("标题调用失败：{message}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,5 +660,95 @@ mod tests {
                 "六节标题必须随请求发给模型，缺「{heading}」：{sent}"
             );
         }
+    }
+
+    // ───────────────────────── G37：会话标题生成 ─────────────────────────
+
+    /// 起名请求与摘要同一条装配线：指令打头、清洗后的原文原样跟上、无工具、无温度。
+    #[test]
+    fn the_title_request_is_the_instruction_plus_the_dropped_source() {
+        let req = title_request(&src_messages());
+        assert_eq!(req.messages.len(), 1 + src_messages().len());
+        assert_eq!(req.messages[0].role, Role::System);
+        assert_eq!(req.messages[0].text_of(), TITLE_INSTRUCTION);
+        assert_eq!(&req.messages[1..], src_messages().as_slice());
+        assert!(req.tools.is_empty(), "起名不许带任何工具声明");
+        assert_eq!(req.temperature, None, "起名是收敛任务，不吃用户的风格旋钮");
+    }
+
+    #[test]
+    fn the_title_sanitizer_unwraps_one_paired_shell_and_folds_lines() {
+        assert_eq!(sanitize_title(" 帮我配环境 "), "帮我配环境");
+        // 成对的外壳剥一层：英文直引号、中文弯引号、方角引号、书名号。
+        assert_eq!(sanitize_title("\"配 Rust 环境\""), "配 Rust 环境");
+        assert_eq!(
+            sanitize_title("\u{201c}配 Rust 环境\u{201d}"),
+            "配 Rust 环境"
+        );
+        assert_eq!(sanitize_title("「配 Rust 环境」"), "配 Rust 环境");
+        assert_eq!(sanitize_title("《配 Rust 环境》"), "配 Rust 环境");
+        // 不对称不剥：剥一半比不剥更难看。
+        assert_eq!(sanitize_title("\"配 Rust 环境"), "\"配 Rust 环境");
+        assert_eq!(sanitize_title("配 Rust 环境》"), "配 Rust 环境》");
+        // 只剥一层：套两层的外壳留内层一对，不猜模型意图。
+        assert_eq!(sanitize_title("《「起名」》"), "「起名」");
+        // 换行与多空白折叠成单空格；首尾空白归零。
+        assert_eq!(sanitize_title("配 Rust\n\n环境\r\n吧"), "配 Rust 环境 吧");
+        // 空引号 / 纯空白 → 空串：调用方据此走降级路径。
+        assert_eq!(sanitize_title("\"\""), "");
+        assert_eq!(sanitize_title("   \n  "), "");
+    }
+
+    #[tokio::test]
+    async fn collect_title_returns_the_model_text_verbatim() {
+        let model = TextModel::new(&["配 Rust 环境", "，顺便装", "镜像源"]);
+        let got = collect_title(&*model, title_request(&src_messages()), &never_cancelled())
+            .await
+            .expect("这条夹具必须成功");
+        assert_eq!(got, "配 Rust 环境，顺便装镜像源");
+        assert_eq!(model.recorder.calls().len(), 1, "一次起名一次调用");
+    }
+
+    #[tokio::test]
+    async fn an_empty_title_is_an_error_not_a_rename_to_nothing() {
+        // 注意 `collect_title` 不清洗：`"\"\""` 这样的带壳文本会按原样 Ok 返回，
+        // 剥壳归 sanitize_title（清洗后为空的降级在 ipc.rs 挂接处）。这里只钉
+        // 「模型真的什么都没给」的路径。
+        for parts in [vec![], vec!["  \n "]] {
+            let model = TextModel::new(&parts);
+            let got =
+                collect_title(&*model, title_request(&src_messages()), &never_cancelled()).await;
+            assert!(
+                got.is_err(),
+                "空标题（{parts:?}）被当成成功返回：把「新对话」改名成空串是净损失"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_title_returns_an_error_and_renames_to_nothing() {
+        // 取消发生在「模型还在写标题」时：与摘要同一条裁定——半条标题不是标题。
+        let ready = Arc::new(AtomicBool::new(false));
+        let model = Arc::new(StallingModel {
+            head: vec![ModelDelta::Text("配 Rust".into())],
+            ready: ready.clone(),
+            recorder: Recorder::default(),
+        });
+        let cancel = CancellationToken::new();
+        let (got, ()) = tokio::join!(
+            collect_title(&*model, title_request(&src_messages()), &cancel),
+            async {
+                while !ready.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                cancel.cancel();
+            }
+        );
+        assert!(got.is_err(), "取消之后不许返回 Ok，实际：{got:?}");
+        assert_eq!(
+            model.recorder.calls().len(),
+            1,
+            "夹具前提：模型确实被叫过一次"
+        );
     }
 }

@@ -102,22 +102,29 @@ export function ImageStrip({
       {/* R144：第三个入口是 `<input type="file">`，不是 dialog 返回的路径 ——
           capabilities 只有 `dialog:allow-open`、没有任何 fs 读权限，拿到路径也读不出字节，
           而为它放权直接违反「前端不得有文件/执行能力」这条红线。
-          原生产物控件本身就是可访问的入口，不需要「隐藏的 input + 自造按钮」那一套。 */}
-      <input
-        className="image-file-input"
-        data-testid="file-input"
-        type="file"
-        multiple
-        accept="image/*"
-        disabled={disabled}
-        aria-label="选择图片"
-        onChange={(e) => {
-          const files = Array.from(e.target.files ?? []);
-          // 不清 value 的话，连续选取**同一个**文件不会触发 change（R144 的连带要求）。
-          e.target.value = "";
-          onPick(files);
-        }}
-      />
+          入口**还是那个 input**（testid、change 合同、「清 value 允许重选同一文件」都不变），
+          2026-11-08 换成「label + 视觉隐藏的 input」：可见的那枚「添加图片」是普通 DOM，
+          文案归我们 —— 之前是给 UA 按钮做皮肤，而「选择文件」那串字是引擎画的，
+          `content` 打不进去（styles.css 旧注释实测过），它成了输入区里唯一一块
+          系统默认模板的残留。键盘 Tab 到 input 回车、或点 label 任意处，都开同一个选择器。 */}
+      <label className="image-file-entry">
+        <span className="image-file-button">添加图片</span>
+        <input
+          className="image-file-input"
+          data-testid="file-input"
+          type="file"
+          multiple
+          accept="image/*"
+          disabled={disabled}
+          aria-label="添加图片"
+          onChange={(e) => {
+            const files = Array.from(e.target.files ?? []);
+            // 不清 value 的话，连续选取**同一个**文件不会触发 change（R144 的连带要求）。
+            e.target.value = "";
+            onPick(files);
+          }}
+        />
+      </label>
     </div>
   );
 }

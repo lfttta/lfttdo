@@ -530,6 +530,7 @@ function MessageBubbleView({
   onRespond,
   onOpenLink,
   onRevealPath,
+  onRetry,
 }: {
   turn: Turn;
   isLastTurn: boolean;
@@ -537,6 +538,12 @@ function MessageBubbleView({
   onRespond: (id: string, d: Decision) => void;
   onOpenLink?: (url: string) => void;
   onRevealPath?: (path: string) => void;
+  /**
+   * G39：「重试这一轮」—— 截断最后一轮并重发原话，只在**最后一条** assistant
+   * 气泡且非流式时出现（历史中间的轮次截了会把后面还没看完的内容一起删掉，
+   * 那是另一个功能）。动作本身在 App：截断 → 重放 → 重发，这里只是一个按钮。
+   */
+  onRetry?: () => void;
 }) {
   const lastIndexOf = turn.blocks.length - 1;
   // R234：空的助手气泡有两种来路 —— 等首字（该留着并看得出在等）与这一轮已结束
@@ -567,6 +574,16 @@ function MessageBubbleView({
       {copyText === "" ? null : (
         <CopyButton testId="bubble-copy" getText={() => copyText} />
       )}
+      {turn.role === "assistant" && !streaming && isLastTurn && onRetry ? (
+        <button
+          type="button"
+          className="bubble-retry"
+          data-testid="bubble-retry"
+          onClick={onRetry}
+        >
+          ↻ 重试这一轮
+        </button>
+      ) : null}
     </article>
   );
 }

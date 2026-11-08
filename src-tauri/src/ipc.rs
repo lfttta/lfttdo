@@ -11,7 +11,10 @@ use crate::agent::memory::{
     merge_profile,
 };
 use crate::agent::session::{AgentProfile, AgentSession, SessionConfig, SessionDeps};
-use crate::agent::summarize::{SUMMARY_OMITTED, collect_summary, summary_note, summary_request};
+use crate::agent::summarize::{
+    SUMMARY_OMITTED, collect_summary, collect_title, sanitize_title, summary_note, summary_request,
+    title_request,
+};
 use crate::agent::types::{ContentBlock, Message, Role};
 use crate::mcp::bridge::{McpBridge, McpTool, ServerStatus};
 use crate::mcp::config::ServerDef;
@@ -141,6 +144,10 @@ pub struct TauriEmitter {
     session_id: String,
     coalescer: Coalescer,
     images_dir: Option<PathBuf>,
+    /// G36：`needs_attention` 命中时调用的动作（生产 = 失焦时闪任务栏；测试 = None）。
+    /// 判定在事件层（`agent::events::needs_attention`），动作在这支闭包 —— 注入闭包
+    /// 而不是 AppHandle，TauriEmitter 才能在本模块单测里继续裸构造（AppHandle 造不出来）。
+    notify: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl TauriEmitter {
@@ -150,11 +157,19 @@ impl TauriEmitter {
             session_id,
             coalescer: Coalescer::new(),
             images_dir: None,
+            notify: None,
         }
     }
 
     pub fn with_images_dir(mut self, dir: PathBuf) -> Self {
         self.images_dir = Some(dir);
+        self
+    }
+
+    /// G36：装配「拉回用户注意力」的动作。只在 `needs_attention` 的事件上被调，
+    /// 失焦与否的判定在闭包里（那里才拿得到窗口）。
+    pub fn with_notify(mut self, notify: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.notify = Some(notify);
         self
     }
 
@@ -189,6 +204,13 @@ impl EventSink for TauriEmitter {
                 if let Some(dir) = &self.images_dir {
                     crate::image_cache::enrich_event(&mut event, dir);
                 }
+                // G36：要人决策/收尾的事件交给 OS 注意力机制（失焦才闪，判定在闭包）。
+                // 动作失败不反馈进事件流 —— 闪不了任务栏不该变成一条对话错误。
+                if crate::agent::events::needs_attention(&event)
+                    && let Some(notify) = &self.notify
+                {
+                    notify();
+                }
                 self.send(event);
             }
         }
@@ -201,7 +223,7 @@ impl EventSink for TauriEmitter {
 const AGENT_CHANNEL: &str = "agent";
 
 /// 新会话的默认标题。**自动改名只在这个值仍然成立时才进行**（R104），
-/// 所以 `session_create` 与 `auto_title` 必须读同一个常量，不许各写一遍字面量。
+/// 所以 `session_create` 与 G37 的自动起名任务必须读同一个常量，不许各写一遍字面量。
 pub const DEFAULT_TITLE: &str = "新对话";
 
 // R109 的处置本身住在 `crate::lock`（与 `settings.rs`、`store/db.rs`、
@@ -1355,6 +1377,14 @@ pub async fn run_turn(
     }
     let sid = session_id.to_string();
 
+    // G37 起名任务的提前捕获：cancel 在下面的 TurnToken 装配处、model 在会话装配处
+    // 都会被 move，这里（读库前）是它们都还活着的最早一段。落库成功后收尾段
+    // （Done 发射前）用这几份克隆起一个异步任务生成标题；fresh 那份在它创建处克隆。
+    let namer_model = model.clone();
+    // `guard().clone()` 解出 `Option<CancellationToken>`（`session_delete` 同一惯用法）。
+    // None = 本轮没挂真实令牌（测试场景），届时换一把永不取消的默认令牌——语义正确。
+    let namer_cancel: Option<CancellationToken> = guard(&cancel).clone();
+
     // 读库失败（含 R71 的「某一行解不开」）直接报错，不返回「看起来完整」的历史。
     let reader = db.clone();
     let read_sid = sid.clone();
@@ -1536,6 +1566,9 @@ pub async fn run_turn(
     let reason = session.run(blocks).await;
 
     let fresh = session.history()[prior..].to_vec();
+    // G37：起名任务要的是「本轮新增的那段对话」，与落库的是同一份；落库闭包会
+    // move 走 fresh，这里先克隆出起名任务的那份。
+    let namer_history = fresh.clone();
     let writer = db.clone();
     let write_sid = sid.clone();
     match blocking(move || append_rows(&writer, &write_sid, &fresh).map_err(|e| e.to_string()))
@@ -1560,13 +1593,83 @@ pub async fn run_turn(
 
     // 自动改名是**附带**行为：它失败不能让一次已经落库的发送整体失败
     // （否则前端会回滚用户气泡，而这一轮其实已经存下来了）。
-    let typer = db.clone();
-    let title_sid = sid.clone();
-    if let Err(reason) =
-        blocking(move || auto_title(&typer, &title_sid).map_err(|e| e.to_string())).await
-    {
-        tracing::warn!("会话 {sid} 自动改名失败（本轮已落库，不影响发送结果）：{reason}");
-    }
+    //
+    // G37：命名从 R104 的「截断首条消息」升级为「模型生成标题」（summarize::collect_title，
+    // 与摘要同一套收流/清洗/无温度）。生成放在 Done 之后的独立任务里跑：本地端点一次
+    // 调用要数秒，收尾不该等它。取消令牌沿用本轮的 cancel —— 用户按停，未完成的起名
+    // 随之取消，不与「用户已不在场」的事实打架。模型失败或清洗为空时，降级回 R104 的
+    // 首条消息截断路径（fallback_title）；降级也拿不到文本就保持「新对话」，只进日志。
+    let namer_db = db.clone();
+    let namer_sid = sid.clone();
+    // namer_model / namer_cancel / namer_history 在本轮靠前处捕获（cancel/model 之后
+    // 被 move、fresh 在落库闭包处被 move）。
+    tokio::spawn(async move {
+        let namer_cancel = namer_cancel.unwrap_or_default();
+        // R104 语义原样保留：只对仍是默认「新对话」的会话起名，用户起的名字永不覆盖。
+        // 判断走 list_sessions：Db 没有按 id 取标题的入口，而 Plan A 的会话数量级
+        // 不值得为它加一条 SQL（一条只服务于这里的读法，就是给「谁拥有标题」
+        // 再造一个答案）。
+        let checker = namer_db.clone();
+        let check_sid = namer_sid.clone();
+        let still_default = blocking(move || {
+            checker
+                .list_sessions()
+                .map(|ls| {
+                    ls.iter()
+                        .any(|s| s.id == check_sid && s.title == DEFAULT_TITLE)
+                })
+                .map_err(|e| e.to_string())
+        })
+        .await;
+        let still_default = match still_default {
+            Ok(v) => v,
+            Err(reason) => {
+                tracing::warn!("会话 {namer_sid} 起名前的标题检查失败，放弃本次起名：{reason}");
+                return;
+            }
+        };
+        if !still_default {
+            return;
+        }
+        let generated =
+            collect_title(&*namer_model, title_request(&namer_history), &namer_cancel).await;
+        let title = match generated {
+            Ok(raw) => {
+                // 截断归调用方：上限复用 db::TITLE_CHARS，第二份字面量就是第二份真相。
+                let cleaned = crate::text::truncate_display(
+                    &sanitize_title(&raw),
+                    crate::store::db::TITLE_CHARS,
+                );
+                if cleaned.is_empty() {
+                    tracing::warn!("会话 {namer_sid} 模型标题清洗后为空，降级为首条消息截断");
+                    fallback_title(&namer_db, &namer_sid).await
+                } else {
+                    Some(cleaned)
+                }
+            }
+            // 取消优先于失败：用户按了停止，保持原名不算任何一种错误。
+            Err(_) if namer_cancel.is_cancelled() => None,
+            Err(reason) => {
+                tracing::warn!("会话 {namer_sid} 模型起名失败，降级为首条消息截断：{reason}");
+                fallback_title(&namer_db, &namer_sid).await
+            }
+        };
+        if let Some(title) = title {
+            let writer = namer_db.clone();
+            let rename_sid = namer_sid.clone();
+            if let Err(reason) = blocking(move || {
+                writer
+                    .rename_session(&rename_sid, &title)
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            {
+                tracing::warn!(
+                    "会话 {namer_sid} 自动改名落库失败（本轮已落库，不影响发送结果）：{reason}"
+                );
+            }
+        }
+    });
 
     finish_sink.emit(AgentEvent::Done {
         stop_reason: reason,
@@ -1580,27 +1683,18 @@ fn append_rows(db: &Db, session_id: &str, rows: &[Message]) -> Result<(), rusqli
     db.append_messages(session_id, rows)
 }
 
-/// R104：自动改名**只**在标题仍是默认「新对话」时发生。brief:161-163 的无条件
-/// `rename_session` 会在下一次发送时把用户手工起的名字冲掉。
-///
-/// 默认标题走 `list_sessions`：`Db` 没有按 id 取标题的入口，而 Plan A 的会话数量级
-/// 不值得为它加一条 SQL —— 一条只服务于这里的读法，就是给「谁拥有标题」再造一个答案。
-/// 标题文本沿用 `latest_user_message`：它已经截到 40 字符、并且跳过工具结果行（R75），
-/// 在这里再截一遍就是第二份真相（R77 同一条理由）。
-fn auto_title(db: &Db, session_id: &str) -> Result<(), rusqlite::Error> {
-    let still_default = db
-        .list_sessions()?
-        .iter()
-        .any(|s| s.id == session_id && s.title == DEFAULT_TITLE);
-    if !still_default {
-        return Ok(());
+/// G37 的降级路径：模型起名不可用时沿用 R104 的「截断首条消息」。
+/// 与旧 `auto_title` 的差别只在不做 still_default 检查——调用方在起名任务开头查过，
+/// 同一会话的下一轮被 `running` 槽挡着，两次检查之间没有别的写手。
+/// 标题文本沿用 `latest_user_message`：它已经截到 `TITLE_CHARS`、并且跳过工具结果
+/// 行（R75），在这里再截一遍就是第二份真相（R77 同一条理由）。
+async fn fallback_title(db: &Arc<Db>, session_id: &str) -> Option<String> {
+    let reader = db.clone();
+    let sid = session_id.to_string();
+    match blocking(move || reader.latest_user_message(&sid).map_err(|e| e.to_string())).await {
+        Ok(Some(title)) if !title.is_empty() => Some(title),
+        _ => None,
     }
-    if let Some(title) = db.latest_user_message(session_id)?
-        && !title.is_empty()
-    {
-        db.rename_session(session_id, &title)?;
-    }
-    Ok(())
 }
 
 /// 装配层的 key 闸门：`None` 时究竟是拒绝还是放行，判据只有一个 —— 端点是不是回环。
@@ -1738,8 +1832,22 @@ pub async fn send_message(
     let output_dir = resolve_session_output(&app, &state, &settings, &session_id)?;
     let image_dir = output_dir.join(crate::image_cache::CACHE_SUBDIR);
     let emitter = Arc::new(
-        TauriEmitter::new(Arc::new(AppPublisher { app }), session_id.clone())
-            .with_images_dir(image_dir),
+        TauriEmitter::new(
+            Arc::new(AppPublisher { app: app.clone() }),
+            session_id.clone(),
+        )
+        .with_images_dir(image_dir)
+        // G36：失焦时闪一下任务栏（Informational 档）；聚焦中闪是骚扰，所以闸在闭包里。
+        .with_notify({
+            let app = app.clone();
+            Arc::new(move || {
+                if let Some(w) = app.get_webview_window("main")
+                    && matches!(w.is_focused(), Ok(false))
+                {
+                    let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
+                }
+            })
+        }),
     );
     // 会话作用域在**真正开跑**之前对齐：配置/凭据失败的那次发送没有开跑，
     // 不该顺手清掉上一轮用户答过的授权。
@@ -2276,6 +2384,24 @@ pub async fn session_delete(state: State<'_, AppState>, id: String) -> Result<()
     blocking(move || db.delete_session(&id).map_err(|e| e.to_string())).await
 }
 
+/// G39：重试最后一轮 —— 删掉最后一轮的全部行（截断事务在
+/// `Db::truncate_last_user_turn`），把用户原话（含图块）交回去重发。
+/// 正在跑的那一轮不许重试（`session_delete` 同一 guard 惯用法，单道就够：
+/// 截断与进行中的落库赛跑没有赢家，第二条并发请求会被同一道闸挡下）。
+/// `Ok(None)` = 没有可重试的轮（空会话 / 只剩备注与辅助行），前端静默。
+#[tauri::command]
+pub async fn session_retry_last(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<Vec<ContentBlock>>, String> {
+    let owns_the_running_turn = guard(&state.running).as_deref() == Some(id.as_str());
+    if owns_the_running_turn {
+        return Err("这一轮还在跑，停止后再重试".to_string());
+    }
+    let db = state.db.clone();
+    blocking(move || db.truncate_last_user_turn(&id).map_err(|e| e.to_string())).await
+}
+
 #[tauri::command]
 pub async fn session_messages(
     app: AppHandle,
@@ -2356,6 +2482,127 @@ pub async fn session_workspace_set(
             .map_err(|e| e.to_string())
     })
     .await
+}
+
+// ───────────────────────── G38：会话导出为 Markdown ─────────────────────────
+
+/// 导出里一个块的一行（`None` = 这个块不值得导出）。文本块原样、图片占位、
+/// 工具调用与结果折成一行引用 —— 导出是给人存档/转发的，完整输出留在库里。
+/// 工具结果预览走 `ToolOutput::preview()`（R77：预览全仓库只此一份实现），
+/// 导出再造一份截断就是第二份口径。
+fn export_block(b: &ContentBlock) -> Option<String> {
+    match b {
+        ContentBlock::Text { text } if text.trim().is_empty() => None,
+        ContentBlock::Text { text } => Some(text.clone()),
+        ContentBlock::Image { mime, .. } => Some(format!(
+            "[图片 {}]",
+            match mime {
+                crate::agent::types::ImageMime::Png => "png",
+                crate::agent::types::ImageMime::Jpeg => "jpeg",
+            }
+        )),
+        ContentBlock::ToolCall { name, input, .. } => {
+            // 入参一行化（紧凑 JSON），失败就原样落 Debug —— 导出不因坏 JSON 而丢行。
+            let flat = serde_json::to_string(input).unwrap_or_else(|_| format!("{input:?}"));
+            Some(format!("> 🔧 调用 `{name}`：`{flat}`"))
+        }
+        ContentBlock::ToolResult {
+            is_error, output, ..
+        } => {
+            let mark = if *is_error { "⚠" } else { "↳" };
+            Some(format!("> {mark} {}", output.preview()))
+        }
+    }
+}
+
+/// G38：把一个会话转成 Markdown。标题 + 每条消息一节。
+/// 角色标题自备（导出格式不是线上协议）；System 行保留为一节 —— 它是压缩摘要
+/// 的落库形状（`summarize.rs`），跳过它导出的对话就缺了被压缩掉的那段背景。
+pub fn messages_to_markdown(title: &str, msgs: &[Message]) -> String {
+    let heading = |role: &Role| match role {
+        Role::User => Some("## 🧑 用户"),
+        Role::Assistant => Some("## 🤖 助手"),
+        Role::System => Some("## 📋 摘要"),
+    };
+    let mut out = format!("# {title}\n\n> 导出自 LFTTDO\n");
+    for m in msgs {
+        let Some(head) = heading(&m.role) else {
+            continue;
+        };
+        let body: Vec<String> = m.blocks.iter().filter_map(export_block).collect();
+        if body.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n{head}\n\n"));
+        for line in body {
+            out.push_str(&line);
+            out.push('\n');
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// 导出建议文件名：Windows 文件名里的非法字符（`\/:*?"<>|`）与结尾的空白/点
+/// 一律换成 `_` —— 换而不是剔除，标题的可读性保得住，路径也不会非法。
+pub fn sanitize_export_filename(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_end_matches([' ', '.']);
+    if trimmed.is_empty() {
+        "导出会话".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// G38：导出一个会话为 `.md`。用户在保存对话框里取消 = `Ok(None)`（不是错误）。
+#[tauri::command]
+pub async fn session_export(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<String>, String> {
+    let db = state.db.clone();
+    let (title, md) = blocking(move || {
+        let title = db
+            .list_sessions()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|s| s.id == session_id)
+            .map(|s| s.title)
+            .ok_or_else(|| "会话不存在".to_string())?;
+        let msgs = db.messages(&session_id).map_err(|e| e.to_string())?;
+        if msgs.is_empty() {
+            return Err("这个会话还没有可导出的内容".to_string());
+        }
+        // 先借 title 渲染、后把它移进返回元组：元组元素从左到右求值，写反就是
+        // 「move 之后借」的编译错。
+        let md = messages_to_markdown(&title, &msgs);
+        Ok((title, md))
+    })
+    .await?;
+    let picked = blocking(move || {
+        Ok::<_, String>(
+            rfd::FileDialog::new()
+                .add_filter("Markdown", &["md"])
+                .set_file_name(format!("{}.md", sanitize_export_filename(&title)))
+                .save_file(),
+        )
+    })
+    .await?;
+    let Some(path) = picked else {
+        return Ok(None);
+    };
+    std::fs::write(&path, md.as_bytes()).map_err(|e| format!("写入失败：{e}"))?;
+    Ok(Some(crate::tools::fs_write::display_path(&path)))
 }
 
 #[tauri::command]
@@ -2663,12 +2910,25 @@ pub async fn settings_get(state: State<'_, AppState>) -> Result<SettingsView, St
 }
 
 #[tauri::command]
-pub async fn settings_set(state: State<'_, AppState>, settings: Settings) -> Result<(), String> {
+pub async fn settings_set(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    settings: Settings,
+) -> Result<(), String> {
     if !settings.storage_dir.trim().is_empty() {
         crate::workspace::resolve_storage_root(&settings.storage_dir, &state.data_dir, None)?;
     }
     let store = state.settings.clone();
-    blocking(move || store.save(&settings).map_err(|e| e.to_string())).await
+    let mode = settings.mode;
+    blocking(move || store.save(&settings).map_err(|e| e.to_string())).await?;
+    // 落盘生效的同一刻把**原生标题栏**一起翻面：网页那份由前端 `applySettingsTheme`
+    // 负责（AppSettings 保存后应用），系统画的那一条归这里 —— 两个入口共用
+    // `native_theme` 一份映射。取不到窗口 / set_theme 失败都按无害处理：这只是
+    // 装饰性的一层，不该把一次已经落盘成功的保存报成失败。
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.set_theme(Some(native_theme(mode)));
+    }
+    Ok(())
 }
 
 /// key 进来之后只做一件事：交给凭据管理器。不打印、不写日志、不进返回值（spec:473）。
@@ -2861,6 +3121,91 @@ fn work_area(monitor: &tauri::Monitor) -> (i32, i32, u32, u32) {
         area.size.width,
         area.size.height,
     )
+}
+
+/// 设置里的明暗档（`settings::Mode`）→ 原生窗口主题。标题栏是**系统**画的：
+/// tokens/presets/glass 三层 CSS 都管不到它，不点名它就永远停在系统默认的浅色上
+/// —— 深色玻璃界面顶上横着一条白（2026-11-08 真机确认）。两个入口共用这一份映射：
+/// 窗口创建（`setup`，首帧即对）与 `settings_set`（保存时翻面）；别处不许再写第二份。
+fn native_theme(mode: crate::settings::Mode) -> tauri::Theme {
+    match mode {
+        crate::settings::Mode::Light => tauri::Theme::Light,
+        crate::settings::Mode::Dark => tauri::Theme::Dark,
+    }
+}
+
+/// 标题栏的**精确**着色（2026-11-08，用户的「跟界面一个颜色」）：`.theme()` 只能给
+/// 系统的明暗两档灰，跟主题色永远差着一截（dusk 是暖褐，系统暗档是中性灰）。
+/// DWMWA_CAPTION_COLOR / DWMWA_TEXT_COLOR（Windows 11 22000+）允许上任意色值。
+/// 颜色的唯一真相仍是 `tokens.css`/`presets.css` —— 前端从**计算样式**现读现递，
+/// Rust 这里不建第二份色值表。
+const DWMWA_CAPTION_COLOR: u32 = 35;
+const DWMWA_TEXT_COLOR: u32 = 36;
+
+/// `#rrggbb` → COLORREF（0x00BBGGRR，DWM 的字节序跟 CSS 正好反过来）。
+/// 只认六位十六进制：玻璃层的 `--bg-surface` 是带透明度的 `rgb()`，DWM 上不了色；
+/// 拒收它，让调用方回落（前端只递解析得了的）。
+#[cfg(windows)]
+fn colorref_of(hex: &str) -> Result<u32, String> {
+    let body = hex.strip_prefix('#').unwrap_or(hex);
+    if body.len() != 6 || !body.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("不是 #rrggbb 颜色：{hex}"));
+    }
+    let value = u32::from_str_radix(body, 16).map_err(|e| e.to_string())?;
+    let (r, g, b) = ((value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff);
+    Ok(r | (g << 8) | (b << 16))
+}
+
+#[cfg(windows)]
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    fn DwmSetWindowAttribute(
+        hwnd: isize,
+        attr: u32,
+        value: *const core::ffi::c_void,
+        size: u32,
+    ) -> core::ffi::c_long;
+}
+
+/// 把标题栏染成界面自己的颜色（底色 `caption`、标题文字 `text`）。
+/// 系统画的那条标题栏跟主题色对不上（见 `native_theme`），而 `.theme()` 只有两档；
+/// 这条命令让**前端**把计算样式里现读的色值递进来，DWM 精确上色 —— 色值的
+/// 唯一真相仍是 CSS 那两份，Rust 不抄色表。旧系统（Win10 < 22000）没有这两个
+/// 属性，DWM 返回非零 HRESULT：原样报 Err，由前端决定吞不吞（它吞，理由在那边）。
+#[tauri::command]
+pub fn set_caption_color(
+    window: tauri::WebviewWindow,
+    caption: String,
+    text: String,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // tauri 的 `hwnd()` 把句柄包在 `HWND(...)` 里，Windows 版 windows crate
+        // 的裸字段是 `*mut c_void`，DWM 的 ABI 要的是 isize —— 在这里折一下。
+        let hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as isize;
+        for (attr, color) in [
+            (DWMWA_CAPTION_COLOR, caption.as_str()),
+            (DWMWA_TEXT_COLOR, text.as_str()),
+        ] {
+            let colorref = colorref_of(color)?;
+            // SAFETY：DWM 契约里 35/36 号属性各读一个 4 字节的 COLORREF，
+            // `&colorref` 恰好提供这么大的一块。
+            let hr = unsafe {
+                DwmSetWindowAttribute(
+                    hwnd,
+                    attr,
+                    &colorref as *const u32 as *const core::ffi::c_void,
+                    4,
+                )
+            };
+            if hr != 0 {
+                return Err(format!("DwmSetWindowAttribute({attr}) 失败：0x{hr:08x}"));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (window, caption, text);
+    Ok(())
 }
 
 /// T46b：按存档几何恢复窗口。**任何一步不成立就退回创建时的默认尺寸**，
@@ -3282,6 +3627,16 @@ pub fn run() {
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("LFTTDO")
                 .inner_size(800.0, 600.0)
+                // 标题栏跟着设置里的明暗档走（`native_theme` 的说明）：首帧就是对的，
+                // 不用等前端 settings_get 回来再改。load 失败回落 Dark —— 与
+                // `Settings::default` 的 mode 同一档，不为一次读盘失败换一条白标题栏。
+                .theme(Some(native_theme(
+                    managed
+                        .settings
+                        .load()
+                        .map(|s| s.mode)
+                        .unwrap_or(crate::settings::Mode::Dark),
+                )))
                 .on_navigation(crate::web_guard::navigation_allowed)
                 .build()?;
             restore_window_geometry(app.handle());
@@ -3319,6 +3674,8 @@ pub fn run() {
             session_rename,
             session_delete,
             session_messages,
+            session_export,
+            session_retry_last,
             session_output_view,
             session_workspace_set,
             memories_list,
@@ -3331,6 +3688,7 @@ pub fn run() {
             settings_get,
             settings_set,
             settings_set_api_key,
+            set_caption_color,
             shell_presets,
             shell_profile_validate,
             normalize_image,
@@ -3362,6 +3720,121 @@ mod tests {
     use super::*;
     use crate::agent::types::{Risk, ToolCallView};
     use serde_json::json;
+
+    // G38：导出格式逐字钉住 —— 用户拿去存档的就是这串字节，格式漂移等于历史变味。
+    #[test]
+    fn export_renders_messages_into_a_stable_markdown_shape() {
+        let msgs = vec![
+            Message::system_note("早期对话摘要：用户在调权限门"),
+            Message::user(vec![
+                ContentBlock::Text {
+                    text: "看看这个目录".into(),
+                },
+                ContentBlock::Image {
+                    data: "QUJD".into(),
+                    mime: crate::agent::types::ImageMime::Png,
+                },
+            ]),
+            Message {
+                role: Role::Assistant,
+                blocks: vec![
+                    ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "glob".into(),
+                        input: json!({"pattern": "*.rs"}),
+                    },
+                    ContentBlock::ToolResult {
+                        call_id: "c1".into(),
+                        is_error: false,
+                        output: crate::agent::types::ToolOutput::text("main.rs"),
+                    },
+                    ContentBlock::Text {
+                        text: "目录里有 main.rs。".into(),
+                    },
+                ],
+            },
+        ];
+        let md = messages_to_markdown("调权限门", &msgs);
+        // 逐段锚点：标题、摘要节、用户文本+图片占位、工具折行、助手结论。
+        assert!(md.starts_with("# 调权限门\n\n> 导出自 LFTTDO\n"), "{md}");
+        assert!(
+            md.contains("## 📋 摘要\n\n早期对话摘要：用户在调权限门\n\n"),
+            "{md}"
+        );
+        assert!(
+            md.contains("## 🧑 用户\n\n看看这个目录\n\n[图片 png]\n\n"),
+            "{md}"
+        );
+        assert!(
+            md.contains("> 🔧 调用 `glob`：`{\"pattern\":\"*.rs\"}`\n\n"),
+            "{md}"
+        );
+        assert!(md.contains("> ↳ main.rs\n\n"), "{md}");
+        // 助手节标题后先跟工具折行，结论在最后。
+        assert!(md.contains("## 🤖 助手\n\n> 🔧 调用 `glob`"), "{md}");
+        assert!(md.contains("目录里有 main.rs。\n\n"), "{md}");
+    }
+
+    // G38：空正文不产空节；坏 JSON 的入参降级为 Debug 而不是丢行。
+    #[test]
+    fn export_skips_empty_blocks_and_degrades_broken_json_input() {
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            blocks: vec![
+                ContentBlock::Text { text: "   ".into() },
+                ContentBlock::ToolCall {
+                    id: "c2".into(),
+                    name: "weird".into(),
+                    input: json!({"deep": {"x": 1}}),
+                },
+            ],
+        }];
+        let md = messages_to_markdown("t", &msgs);
+        // 唯一的可见内容是工具行：纯空白文本块不产「## 助手 + 空段」。
+        assert!(md.contains("> 🔧 调用 `weird`"), "{md}");
+        assert!(!md.contains("## 🤖 助手\n\n\n"), "{md}");
+    }
+
+    // G38：Windows 文件名非法字符与结尾的点/空格；清成空串时给兜底名。
+    #[test]
+    fn export_filename_replaces_illegal_characters_and_trailing_dots() {
+        assert_eq!(
+            sanitize_export_filename("a/b\\c:d*e?f\"g<h>i|j.. "),
+            "a_b_c_d_e_f_g_h_i_j"
+        );
+        assert_eq!(sanitize_export_filename("普通标题"), "普通标题");
+        // 「全都不合法」的兜底只在剥掉结尾后真剩空串时触发；??? 会清成 ___（合法文件名）。
+        assert_eq!(sanitize_export_filename("???"), "___");
+        assert_eq!(sanitize_export_filename("... "), "导出会话");
+    }
+
+    // 标题栏主题只认这份映射（`native_theme` 的说明）：两支各归各位。
+    // 写反了的症状是「设置里选了浅色、标题栏还是黑的」——一个纯函数就该有测试，
+    // 而不是等用户在真机上发现。
+    #[test]
+    fn native_theme_follows_the_settings_mode() {
+        assert_eq!(
+            native_theme(crate::settings::Mode::Dark),
+            tauri::Theme::Dark
+        );
+        assert_eq!(
+            native_theme(crate::settings::Mode::Light),
+            tauri::Theme::Light
+        );
+    }
+
+    // COLORREF 的字节序跟 CSS 相反（0x00BBGGRR），写反了的症状是标题栏染成
+    // 一支莫名的互补色。玻璃层那支带透明度的 rgb() 必须被拒收 —— DWM 上不了色，
+    // 静默收下等于染出一支谁也没选过的颜色。
+    #[cfg(windows)]
+    #[test]
+    fn colorref_parses_six_digit_hex_into_dwm_byte_order() {
+        assert_eq!(colorref_of("#221812"), Ok(0x0012_1822));
+        assert_eq!(colorref_of("1a120c"), Ok(0x000c_121a));
+        assert!(colorref_of("rgb(255 255 255 / 8%)").is_err());
+        assert!(colorref_of("#12345").is_err());
+        assert!(colorref_of("#12h456").is_err());
+    }
 
     /// 一个描述超大的只读工具：只为把工具声明推过预算，不参与调用。
     struct BigSchemaTool;
@@ -3594,17 +4067,33 @@ mod tests {
     use tempfile::TempDir;
 
     /// 每轮吐一条固定回复的模型。Plan A 的生产工具表是空的，所以不需要工具轮。
+    ///
+    /// G37 起名请求按**内容分流**：首条 system 是 `TITLE_INSTRUCTION` 的请求固定吐
+    /// [`TEST_TITLE_REPLY`]，不消耗主脚本队列 —— 起名是落库后异步跑的独立任务，
+    /// 不分流它就会插队吃掉下一轮的主回复（修复前 6 条端到端测试集体变红的根因）。
     struct ReplyModel {
         replies: Mutex<std::collections::VecDeque<String>>,
     }
+
+    /// 起名请求的固定标题回复（见 [`ReplyModel`] 的分流注释）。
+    const TEST_TITLE_REPLY: &str = "今天的天气";
 
     #[async_trait]
     impl ModelProvider for ReplyModel {
         fn stream<'a>(
             &'a self,
-            _req: ChatRequest,
+            req: ChatRequest,
         ) -> std::pin::Pin<Box<dyn Stream<Item = Result<ModelDelta, ModelError>> + Send + 'a>>
         {
+            if req.messages.first().is_some_and(|m| {
+                m.role == Role::System && m.text_of() == crate::agent::summarize::TITLE_INSTRUCTION
+            }) {
+                return Box::pin(futures::stream::iter(
+                    vec![ModelDelta::Text(TEST_TITLE_REPLY.to_string())]
+                        .into_iter()
+                        .map(Ok),
+                ));
+            }
             // 取完了就是夹具写错（轮数不够），不许安静地回一条空消息把测试做绿。
             let reply = self
                 .replies
@@ -3861,17 +4350,30 @@ mod tests {
         );
     }
 
-    /// R104 的正向半边：默认标题「新对话」会被第一句真人发言顶掉（截到 40 字符）。
+    /// G37 的正向半边（接替 R104 的同名测试）：默认标题「新对话」在首轮结束后被
+    /// **模型生成的标题**顶掉。起名在落库后的独立任务里异步跑，断言前轮询等它
+    /// 落库 —— 轮询耗尽仍没等到，说明起名任务丢了，同样是失败，不许静默放过。
     #[tokio::test]
-    async fn a_default_title_adopts_the_first_user_message() {
+    async fn a_default_title_adopts_the_model_title() {
         let f = Fixture::new();
         let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
         f.turn(&sid, replies(&["好的"]), "帮我看看今天的天气")
             .await
             .0
             .unwrap();
-        let title = title_of(&f.db, &sid);
-        assert_eq!(title.as_deref(), Some("帮我看看今天的天气"));
+        let mut title = title_of(&f.db, &sid);
+        for _ in 0..200 {
+            if title.as_deref() == Some(TEST_TITLE_REPLY) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            title = title_of(&f.db, &sid);
+        }
+        assert_eq!(
+            title.as_deref(),
+            Some(TEST_TITLE_REPLY),
+            "首轮结束后模型标题应已落库；等不到 = 起名任务没跑或被降级路径抢先"
+        );
     }
 
     /// R104（brief:161-163 的无条件 rename 会在这里转红）：用户手工改过的名字
@@ -4790,6 +5292,11 @@ mod tests {
                 Some(PROFILE_INSTRUCTION) => {
                     Box::pin(futures::stream::iter(one_shot(&self.profile_parts)))
                 }
+                // G37 起名请求：固定吐标题文本、不消耗回答队列 —— 与 ReplyModel 的
+                // 分流同一条理由（起名任务插队会吃掉下一轮主回答，panic 就在兜底臂）。
+                Some(crate::agent::summarize::TITLE_INSTRUCTION) => Box::pin(
+                    futures::stream::iter(vec![Ok(ModelDelta::Text(TEST_TITLE_REPLY.to_string()))]),
+                ),
                 // 回答那一支：取完了就是夹具写错（轮数不够），不许安静地回一条空消息把测试做绿。
                 _ => {
                     let reply = self
@@ -7633,7 +8140,18 @@ mod tests {
         .await
         .unwrap();
         sink.flush();
-        model.calls()
+        // G37：起名是落库后的独立任务，它的 TITLE 请求同样进 FakeModel 的录制序列，
+        // 且时序上可能插在任意两轮之间。这组测试量的是「主对话与记忆管线」的调用，
+        // 起名调用一律滤掉 —— 不过滤的话 calls 的长度与下标都会随调度漂移。
+        model
+            .calls()
+            .into_iter()
+            .filter(|req| {
+                req.messages
+                    .first()
+                    .is_none_or(|m| m.text_of() != crate::agent::summarize::TITLE_INSTRUCTION)
+            })
+            .collect()
     }
 
     /// 请求头里以某前缀开头的那条备注(没有就是 None)。

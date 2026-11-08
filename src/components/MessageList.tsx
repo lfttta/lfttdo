@@ -6,6 +6,16 @@ import type { Decision, ErrorWhere, UiState } from "../types";
 /** 距底多少像素以内算「还想跟着看」：太高会误粘、太低会在一次小增量后脱落。 */
 const NEAR_BOTTOM_PX = 40;
 
+/**
+ * G42：重放/长会话的 turns 可达上百条，`state.turns.map` 全量渲染会把 DOM 撑到
+ * 卡顿（MessageList.test 里「重放一整段历史可以上百条」正是现状）。只渲染最近
+ * `VISIBLE_TURNS` 条，更早的收进顶部一个「展开」按钮 —— reducer 仍持有全部，
+ * 这**纯是渲染层裁剪**，不碰状态层。40 与滑窗默认值（context.rs `window_messages`
+ * 默认 40 轮）同量级纯属巧合：一个是上下文预算、一个是渲染预算，互不依赖。
+ * 展开后不提供「收起」：历史只会越聊越多，收起没有第二回价值。
+ */
+const VISIBLE_TURNS = 40;
+
 /** `ErrorWhere`（types.rs 镜像 events.rs:103-111）只用来把「哪儿炸了」说成人话。 */
 const WHERE_LABEL: Record<ErrorWhere, string> = {
   model: "模型端点",
@@ -85,6 +95,7 @@ export function MessageList({
   onOpenLink,
   onRevealPath,
   onAnswerQuestion,
+  onRetryLast,
 }: {
   state: UiState;
   onRespond: (id: string, d: Decision) => void;
@@ -97,8 +108,21 @@ export function MessageList({
    * 它是时间线上最新的一件事。
    */
   onAnswerQuestion?: (id: string, choice: string) => void;
+  /** G39：「重试最后一轮」的出口（App 接截断→重放→重发链）；缺省 = 按钮不渲染。 */
+  onRetryLast?: () => void;
 }) {
   const lastTurn = state.turns.length - 1;
+
+  /**
+   * G42：折叠态是本组件的**渲染偏好**，不进 UiState —— reducer 是事件折叠的唯一
+   * 地方，渲染裁剪混进去就会跟着事件流一起被重放（重放一个折叠偏好没有意义）。
+   * 切换会话时的重置由 `App` 给本组件挂 `key={activeId}` 完成（重放本来就换整套
+   * turns，重挂的代价是零）。
+   */
+  const [expanded, setExpanded] = useState(false);
+  const hiddenTurns = expanded ? 0 : Math.max(0, state.turns.length - VISIBLE_TURNS);
+  const visibleTurns =
+    hiddenTurns > 0 ? state.turns.slice(state.turns.length - VISIBLE_TURNS) : state.turns;
 
   /**
    * 自动滚底：贴底时随新内容走，用户上翻之后**不再抢**滚动位置；
@@ -134,16 +158,30 @@ export function MessageList({
         </div>
       ) : null}
       <NoticeStrip notices={state.notices} />
+      {hiddenTurns > 0 ? (
+        <button
+          type="button"
+          className="turns-expand"
+          data-testid="turns-expand"
+          onClick={() => setExpanded(true)}
+        >
+          展开更早的 {hiddenTurns} 条
+        </button>
+      ) : null}
       <div className="turns" data-testid="bubble-list">
-        {state.turns.map((t, i) => (
+        {visibleTurns.map((t, i) => (
           <MessageBubble
             key={t.id}
             turn={t}
-            isLastTurn={i === lastTurn}
+            // slice 之后 i 是局部索引，「是不是最后一轮」要按全量下标算：
+            // 差了这个偏移，折叠状态下最后一条回答拿不到 isLastTurn（复制 chip
+            // 那一族行为跟着失灵）。
+            isLastTurn={i + hiddenTurns === lastTurn}
             streaming={state.streaming}
             onRespond={onRespond}
             onOpenLink={onOpenLink}
             onRevealPath={onRevealPath}
+            onRetry={onRetryLast}
           />
         ))}
       </div>
