@@ -708,6 +708,22 @@ export function SettingsPanel({
               <option value="dark">深色</option>
             </select>
           </label>
+          <label className="panel-row">
+            <span>权限模式</span>
+            <select
+              value={form.permission_mode ?? "rules"}
+              onChange={(e) =>
+                setField(
+                  "permission_mode",
+                  e.target.value as Settings["permission_mode"],
+                )
+              }
+            >
+              <option value="rules">规则（默认）</option>
+              <option value="ask_all">全部询问（写与命令逐条弹窗）</option>
+              <option value="trusted">信任模式（自动放行，风险自担）</option>
+            </select>
+          </label>
           {/* 这一行**不用**上面那几行的「`<label className="panel-row">` 套 span + 控件」写法：
               一行里有两个控件，而一个 `<label>` 只指向它第一个 labelable 后代。所以复选框自己带
               一支 `<label>`（可及名「跟随预设」），取色器用 `aria-label` 取同一个可见文案当名字。

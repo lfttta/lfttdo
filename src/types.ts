@@ -317,6 +317,14 @@ export interface Settings {
    * `"bash"`（`DEFAULT_PRESET_ID`）；前端不回落第二遍，下拉的选项 = 预设 id ∪ 自定义 id。
    */
   default_shell: string;
+  /**
+   * G31：权限模式三档。`"rules"`=既有规则引擎+会话放行+Read 自动（默认）；
+   * `"ask_all"`=allow 规则与会话放行失效，Write/Exec 逐次弹窗（deny 规则与
+   * server Block 仍权威，Read 仍自动）；`"trusted"`=除 deny/server Block 外
+   * 全部自动放行（用户明示的自担风险档）。**必填**（serde 恒序列化）；
+   * 改完**下一条消息生效**（每轮 send_message 现取，轮内不变）。
+   */
+  permission_mode: "rules" | "ask_all" | "trusted";
 }
 
 /**

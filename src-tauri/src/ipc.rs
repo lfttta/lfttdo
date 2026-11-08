@@ -32,6 +32,7 @@ use crate::tools::memory_search::MemorySearchTool;
 use crate::tools::question::QuestionTool;
 use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::render_html::RenderHtmlTool;
 use crate::tools::shell::{
     ShellCatalog, ShellProfile, ShellTool, detected_presets, ensure_executable, path_search_dirs,
     validate_custom,
@@ -1693,6 +1694,8 @@ pub async fn send_message(
         }
         None => state.gate.rules().clear_tool_rules(),
     }
+    // G31：权限模式同规则注入的口径 —— 每轮现取 settings，轮内不变。
+    state.gate.set_permission_mode(settings.permission_mode);
     // R90：`normalize_base_url("")` 返回空串，settings.rs 不替用户编一个默认端点，
     // 所以这道守卫必须住在装配层 —— 空 base_url 到这里就停。
     if settings.base_url.trim().is_empty() {
@@ -2951,6 +2954,9 @@ pub fn build_production_registry(
     registry.register(Arc::new(MemorySearchTool::new(db)));
     registry.register(Arc::new(WriteFileTool));
     registry.register(Arc::new(EditFileTool));
+    // G32：render_html —— Gen UI 第一块砖。Risk::Write（写会话输出目录 rendered/），
+    // 前端在工具卡里用 sandbox="" 的 iframe 内嵌渲染（禁脚本，交付物是静态 HTML）。
+    registry.register(Arc::new(RenderHtmlTool));
     // G25：experiment 实验循环（autoresearch 精华移植）。Risk::Exec —— 跑任意命令
     // 且直接改 git 状态（keep 提交 / discard 回滚），每次调用都弹窗；
     // base 与 git 都从 ctx.roots/write_root 来，实例状态（last_run）在工具实例上。
@@ -4185,6 +4191,7 @@ mod tests {
                 "memory_search",
                 "question",
                 "read_file",
+                "render_html",
                 "run_command",
                 "task",
                 "todo_write",

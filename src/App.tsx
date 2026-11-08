@@ -780,6 +780,7 @@ export default function App() {
           onStop={stop}
           onNormalize={normalize}
           seed={composerSeed}
+          skillsLoader={api.skillsList}
         />
         <div className="statusbar" data-testid="usage">
           {usageText}

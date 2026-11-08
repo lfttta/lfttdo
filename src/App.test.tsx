@@ -104,6 +104,8 @@ const view = (over: Partial<SettingsView> = {}): SettingsView => ({
   // 无自定义 profile、默认 shell 为 bash（Rust `DEFAULT_PRESET_ID`）。
   shells: [],
   default_shell: "bash",
+  // G31：权限模式（serde 恒序列化，线上没有可选形态）—— 生产默认值 rules。
+  permission_mode: "rules",
   api_key_masked: "…abcd",
   corrupt_backup: null,
   ...over,
@@ -166,6 +168,65 @@ const settled = async () => {
 };
 
 describe("App", () => {
+  // G33：slash 技能快捷菜单 —— `/` 弹菜单（只含启用项）、继续打字过滤、Enter 填入
+  // 与技能面板同一格式的引导语并关菜单。
+  it("opens the slash skill menu on / and fills the phrase on Enter", async () => {
+    h.skillsList.mockResolvedValue({
+      root: "E:\\skills",
+      skills: [
+        {
+          name: "翻译润色",
+          description: "中英互译",
+          folder: "translate",
+          enabled: true,
+        },
+        {
+          name: "停用的",
+          description: "不出现",
+          folder: "off",
+          enabled: false,
+        },
+      ],
+    });
+    render(<App />);
+    await settled();
+    const box = screen.getByLabelText("输入消息");
+    fireEvent.change(box, { target: { value: "/" } });
+    const menu = await screen.findByRole("listbox", { name: "技能快捷菜单" });
+    expect(within(menu).getByText("/翻译润色")).toBeInTheDocument();
+    expect(within(menu).queryByText("/停用的")).toBeNull();
+    // 继续打字 = 继续过滤，菜单不关。
+    fireEvent.change(box, { target: { value: "/翻译" } });
+    expect(within(menu).getByText("/翻译润色")).toBeInTheDocument();
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(box).toHaveValue("使用「翻译润色」技能：");
+    expect(
+      screen.queryByRole("listbox", { name: "技能快捷菜单" }),
+    ).toBeNull();
+  });
+
+  // G33：正文里的斜杠（/etc/hosts）不弹菜单；过滤无命中时菜单也不出现。
+  it("does not open the slash menu for mid-text slashes or empty matches", async () => {
+    h.skillsList.mockResolvedValue({
+      root: "",
+      skills: [
+        { name: "翻译", description: "d", folder: "t", enabled: true },
+      ],
+    });
+    render(<App />);
+    await settled();
+    const box = screen.getByLabelText("输入消息");
+    fireEvent.change(box, { target: { value: "聊聊 /etc/hosts" } });
+    expect(
+      screen.queryByRole("listbox", { name: "技能快捷菜单" }),
+    ).toBeNull();
+    fireEvent.change(box, { target: { value: "/zzz" } });
+    await waitFor(() => expect(h.skillsList).toHaveBeenCalled());
+    expect(
+      screen.queryByRole("listbox", { name: "技能快捷菜单" }),
+    ).toBeNull();
+  });
+
   it("loads the session list, picks the newest and replays it", async () => {
     h.sessions.mockResolvedValue([row("old", 1), row("new", 9), row("mid", 5)]);
     h.replaySession.mockResolvedValue([

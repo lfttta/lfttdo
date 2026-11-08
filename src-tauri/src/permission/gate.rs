@@ -3,6 +3,7 @@
 // 所以 spec 5.1 的「全程零弹窗」在 Plan A 为真；Plan B 只需注册 `fetch_url`。
 use crate::agent::events::{AgentEvent, Decision, EventSink, Scope};
 use crate::agent::types::{Risk, ToolCallView};
+use crate::settings::PermissionMode;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
@@ -516,6 +517,9 @@ pub struct PermissionGate {
     /// 才 `set_sink(emitter)`（plan:3106）。所以这里不能是 `Option<Arc<dyn EventSink>>`
     /// 那种只能在构造时填一次的字段。
     sink: Arc<Mutex<Option<Arc<dyn EventSink>>>>,
+    /// G31：权限模式（rules/ask_all/trusted）。与 sink 同一套「长生命周期、每轮注入」：
+    /// `send_message` 开头按当轮 settings 调 `set_permission_mode`，轮内不变。
+    mode: Arc<RwLock<PermissionMode>>,
 }
 
 /// `select!` 的三种收场，用枚举摊开是为了让「取消」和「窗口消失」各自都必须
@@ -563,6 +567,12 @@ impl PermissionGate {
     /// 语义（两种 JSON 形状、整体替换、Err 不动表）见 `RuleTable::set_tool_rules_from_json`。
     pub fn set_rules_from_json(&self, v: &serde_json::Value) -> Result<(), String> {
         self.rules.set_tool_rules_from_json(v)
+    }
+
+    /// G31：注入本轮权限模式（ipc 每轮 `send_message` 现取 settings，同规则注入的口径：
+    /// 轮内不变，改设置下一条消息生效）。
+    pub fn set_permission_mode(&self, mode: PermissionMode) {
+        *crate::lock::write(&self.mode) = mode;
     }
 
     /// 作用域令牌：工具名 + 这一次操作实际覆盖的范围。
@@ -652,6 +662,9 @@ impl PermissionGate {
             }
             _ => vec![String::new()],
         };
+        // G31：本轮权限模式只改「放行侧」—— server 信任档（上面已收场）与 deny 规则
+        // （下面 Deny 臂）在一切模式下都权威；模式只决定 allow/会话/默认路径放不放。
+        let mode = *crate::lock::read(&self.mode);
         match self.rules.folded_decision(&call.name, &segments) {
             RuleOutcome::Deny { segment, rule } => {
                 // 理由点名命中的规则与违规段；非 Exec 没有「段」（空串），保持 G13 的理由格式。
@@ -665,6 +678,8 @@ impl PermissionGate {
                 };
                 return Decision::deny(reason);
             }
+            // G31：ask_all 档 allow 规则失效 —— 按「未覆盖」处理，继续走弹窗路径。
+            RuleOutcome::Allow if mode == PermissionMode::AskAll => {}
             // Allow：每一段都被 allow 规则覆盖 —— 整体放行。
             RuleOutcome::Allow => return Decision::allow(Scope::Once),
             // Ask（任一段命中 ask）与 Pass（有段落没被任何规则覆盖 / 没有任何段）都不在
@@ -673,8 +688,16 @@ impl PermissionGate {
         }
         // 优先级 2：会话级放行（用户已经在本会话里答过「都行」）。
         // 「本会话」由 IPC 层在切会话时清空（`clear_session_rules`）。
-        if let Some(d) = self.rules.lookup(&key) {
+        // G31：ask_all 档会话放行同样失效 —— 用户要的是「这一轮每步都问」。
+        if mode != PermissionMode::AskAll
+            && let Some(d) = self.rules.lookup(&key)
+        {
             return d; // 命中会话规则：静默放行，不发弹窗事件
+        }
+        // G31：trusted —— 能走到这里（server 信任档、deny 规则都过了）就全部放行，
+        // Read/Write/Exec/MCP 皆然：用户明示「这台机器我自己兜底」的档。
+        if mode == PermissionMode::Trusted {
+            return Decision::allow(Scope::Once);
         }
         // 优先级 3：MVP 默认「Read 一律 Auto」。**MCP 除外**（R321）：T30 的兜底命名把
         // server 段截到 8 个 char，信任表按名字查不到 ⇒ 落到 Auto 就等于「名字越长的 server
@@ -1980,6 +2003,59 @@ mod tests {
         assert!(
             matches!(&d, Decision::Deny { reason } if reason.contains("权限规则")),
             "deny 规则对大写命令同样生效：{d:?}"
+        );
+    }
+
+    /// G31：ask_all 档 —— allow 规则与会话放行都失效，Write 落弹窗路径
+    /// （headless = deny）；deny 规则仍权威。
+    #[tokio::test]
+    async fn ask_all_mode_disables_allow_rules_and_session_allows() {
+        let gate = PermissionGate::new();
+        gate.set_permission_mode(PermissionMode::AskAll);
+        gate.set_rules_from_json(&json!({
+            "write_file": [{"pattern": "*", "action": "allow"}]
+        }))
+        .unwrap();
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: "write_file".into(),
+            risk: Risk::Write,
+            input: json!({"path": "D:\\x\\a.txt", "content": "hi"}),
+        };
+        gate.rules().remember_session(&gate.rule_key(&c));
+        let d = gate.check(&c, &CancellationToken::new()).await;
+        assert!(
+            matches!(&d, Decision::Deny { reason } if reason.contains("没有可应答的界面")),
+            "ask_all 下 allow 规则与会话放行都不许生效：{d:?}"
+        );
+    }
+
+    /// G31：trusted 档 —— Exec 直接静默放行，但 deny 规则仍优先拒绝。
+    #[tokio::test]
+    async fn trusted_mode_auto_allows_but_deny_rules_still_win() {
+        let gate = PermissionGate::new();
+        gate.set_permission_mode(PermissionMode::Trusted);
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: "run_command".into(),
+            risk: Risk::Exec,
+            input: json!({"command": "git status"}),
+        };
+        let d = gate.check(&c, &CancellationToken::new()).await;
+        assert_eq!(
+            d,
+            Decision::allow(Scope::Once),
+            "trusted 下 Exec 静默放行：{d:?}"
+        );
+
+        gate.set_rules_from_json(&json!({
+            "run_command": [{"pattern": "git*", "action": "deny"}]
+        }))
+        .unwrap();
+        let d = gate.check(&c, &CancellationToken::new()).await;
+        assert!(
+            matches!(&d, Decision::Deny { reason } if reason.contains("权限规则")),
+            "trusted 下 deny 规则仍权威：{d:?}"
         );
     }
 

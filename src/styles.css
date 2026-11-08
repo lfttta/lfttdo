@@ -1041,3 +1041,82 @@ button.path-chip:disabled {
 .composer-input:hover {
   scrollbar-color: var(--text-muted) transparent;
 }
+
+/* —— G33：slash 技能快捷菜单（挂在输入框上方） —— */
+.slash-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  max-height: 260px;
+  overflow-y: auto;
+  background: var(--bg-raised);
+}
+
+.slash-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.slash-item.active {
+  background: var(--border);
+}
+
+.slash-name {
+  font-weight: 600;
+}
+
+.slash-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* —— G32：render_html 的内嵌沙箱渲染 —— */
+.rendered-html {
+  margin-top: 6px;
+}
+
+.rendered-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.rendered-frame {
+  width: 100%;
+  height: 320px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-input);
+}
+
+.rendered-frame.expanded {
+  height: 70vh;
+}
+
+.rendered-foot {
+  margin-top: 4px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.rendered-toggle {
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.rendered-toggle:hover {
+  color: inherit;
+}

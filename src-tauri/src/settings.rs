@@ -315,6 +315,24 @@ pub enum Mode {
     Dark,
 }
 
+/// G31：权限模式三档。序列化成 `"rules"`/`"ask_all"`/`"trusted"` 给 TS 镜像与
+/// `settings.json` 用。三档只改**放行侧**：server 信任档与 deny 规则在一切模式下都
+/// 权威（插入点见 `gate.check` 的注释）。serde 不认识的值会让整份 `load()` 回落默认
+/// —— 与 `mode`（明暗档）同一纪律，normalize 不做第二遍。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    /// 默认档：规则引擎 + 会话放行 + Read 自动放行 + 弹窗（加键之前的既有行为）。
+    #[default]
+    Rules,
+    /// 全部询问：allow 规则与会话级放行失效，Write/Exec 逐次弹窗；Read 仍自动放行
+    /// （读本地文件零风险，逐次问只会把弹窗变成噪音）。
+    AskAll,
+    /// 信任模式：走到权限门的调用（server Block / deny 规则都过了的）一律自动放行，
+    /// Read/Write/Exec/MCP 皆然 —— 用户明示「这台机器我自己兜底」的档。
+    Trusted,
+}
+
 /// G19：agent 档案的线格式（OpenCode 的自定义 agent：name/description/prompt/tools）。
 /// `settings.json` 里 `agents` 数组的元素；`active_agent` 指向其中之一即激活。
 /// name 是激活键；prompt/tools 只在激活时生效（未激活的档案只是存档）。
@@ -443,6 +461,10 @@ pub struct Settings {
     /// 回到默认弹窗路径；形状非法时装配侧 warn + 清空（fail-safe 方向：规则缺失只会
     /// 回到「按默认问人」，绝不静默沿用旧规则）。
     pub permission_rules: Option<serde_json::Value>,
+
+    /// G31：权限模式三档（默认 `Rules`）。有面板控件（三选一下拉），**不是**
+    /// carry-through 键。语义与注入点见 `PermissionMode` 与 `gate.check`。
+    pub permission_mode: PermissionMode,
     /// G15：plan 模式（OpenCode 的「只读研究」agent）。`true` = 会话里写入/命令类
     /// 工具调用被直接拒绝（session.rs 的 `PLAN_MODE_NOTE`，不执行、不走权限门），
     /// 读类照常 —— 让模型先调研出方案，退出 plan 模式后再执行修改。消费方是
@@ -517,6 +539,8 @@ impl Default for Settings {
             default_shell: DEFAULT_PRESET_ID.into(),
             // G13：默认没有权限规则 —— 默认路径就是既有弹窗语义，一个字节都不多放行。
             permission_rules: None,
+            // G31：默认 rules —— 三档里最保守的一档，行为与加键之前逐字节一致。
+            permission_mode: PermissionMode::Rules,
             // G15：默认是普通会话 —— plan 拦截不存在，工具路径行为一个字不变。
             plan_mode: false,
             // G18：默认没有诊断命令 —— 历史组装与现状逐字节一致。
@@ -2701,7 +2725,7 @@ mod tests {
     // ---- R89：不加没有消费者的字段 ----
 
     #[test]
-    fn serialized_field_names_are_exactly_the_thirty_settings_fields() {
+    fn serialized_field_names_are_exactly_the_thirty_one_settings_fields() {
         let json = serde_json::to_value(Settings::default()).unwrap();
         let mut keys: Vec<&str> = json
             .as_object()
@@ -2734,6 +2758,7 @@ mod tests {
                 "memory_recall_k",
                 "mode",
                 "model",
+                "permission_mode",
                 "permission_rules",
                 "plan_mode",
                 "reserve_output",
