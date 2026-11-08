@@ -3138,8 +3138,11 @@ fn native_theme(mode: crate::settings::Mode) -> tauri::Theme {
 /// 系统的明暗两档灰，跟主题色永远差着一截（dusk 是暖褐，系统暗档是中性灰）。
 /// DWMWA_CAPTION_COLOR / DWMWA_TEXT_COLOR（Windows 11 22000+）允许上任意色值。
 /// 颜色的唯一真相仍是 `tokens.css`/`presets.css` —— 前端从**计算样式**现读现递，
-/// Rust 这里不建第二份色值表。
+/// Rust 这里不建第二份色值表。仅 Windows 使用（下游 DwmSetWindowAttribute 同 cfg），
+/// Linux 下没有消费者 —— CI 的 Linux clippy 以 dead_code 抓过这一对。
+#[cfg(windows)]
 const DWMWA_CAPTION_COLOR: u32 = 35;
+#[cfg(windows)]
 const DWMWA_TEXT_COLOR: u32 = 36;
 
 /// `#rrggbb` → COLORREF（0x00BBGGRR，DWM 的字节序跟 CSS 正好反过来）。
