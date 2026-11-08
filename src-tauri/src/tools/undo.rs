@@ -122,6 +122,20 @@ impl Tool for UndoTool {
             .pop()
             .ok_or_else(|| ToolError::Failed("没有可撤销的变更（journal 为空）".to_string()))?;
         let target = PathBuf::from(&entry.target);
+        // G30 安全复验：journal 就在 base 里，可被 write_file/edit_file 合法改写；
+        // 恢复目标必须重新证明仍在 base 内（canonicalize 后前缀判定），越界拒绝。
+        let canon_target = target.canonicalize().map_err(|e| {
+            ToolError::Failed(format!("撤销目标无法解析 {}: {e}", target.display()))
+        })?;
+        let canon_base = base
+            .canonicalize()
+            .map_err(|e| ToolError::Failed(format!("工作目录无法解析 {}: {e}", base.display())))?;
+        if !canon_target.starts_with(&canon_base) {
+            return Err(ToolError::Failed(format!(
+                "撤销目标越界（不在工作目录内），拒绝恢复: {}",
+                target.display()
+            )));
+        }
         let Some(name) = &entry.snapshot else {
             // journal 里理论上只有「已存在文件的变更」；这个分支只为老 journal 兜底。
             return Err(ToolError::Failed(format!(
@@ -225,6 +239,38 @@ mod tests {
         let c2 = ctx(vec![tmp.path().to_path_buf()], None);
         run(&c2).await.unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "v0");
+    }
+
+    /// G30 安全复验：journal 在 base 内可被文件工具改写 —— 篡改成 base 外的目标
+    /// 后，撤销必须拒绝且不写盘（undo 的弹窗入参为空，这层校验是唯一防线）。
+    #[tokio::test]
+    async fn a_tampered_journal_target_outside_base_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "original").unwrap();
+        let ctx = ctx(
+            vec![tmp.path().to_path_buf()],
+            Some(tmp.path().to_path_buf()),
+        );
+        write_journal(
+            tmp.path(),
+            &[JournalEntry {
+                target: victim.to_string_lossy().into_owned(),
+                snapshot: None,
+            }],
+        )
+        .unwrap();
+        let err = run(&ctx).await.unwrap_err();
+        assert!(
+            matches!(&err, ToolError::Failed(m) if m.contains("越界")),
+            "越界目标必须拒绝：{err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "original",
+            "工作目录外的文件不许被撤销触碰到"
+        );
     }
 
     /// 快照按内容哈希命名：同一内容两次快照不翻倍占盘。

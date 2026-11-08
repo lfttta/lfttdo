@@ -99,7 +99,14 @@ mod tests {
         let path = PathBuf::from(&out[start..start + end]);
         let full = std::fs::read_to_string(&path).unwrap();
         assert_eq!(full, big, "落盘的是完整输出");
-        assert!(path.to_str().unwrap().contains(".lfttdo/outputs"));
+        assert!(
+            path.to_str()
+                .unwrap()
+                .replace('\\', "/")
+                .contains(".lfttdo/outputs"),
+            "落盘目录应是 <write_root>/.lfttdo/outputs：{}",
+            path.display()
+        );
     }
 
     #[test]

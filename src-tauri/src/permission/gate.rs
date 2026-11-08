@@ -306,7 +306,15 @@ impl RuleTable {
         }?;
         let mut hit = None;
         for r in rules {
-            if r.pattern == tool || crate::tools::grep::wildcard_match(scope, &r.pattern) {
+            // G29：scope 匹配按 ASCII 大小写折叠 —— cmd/PowerShell 的命令名大小写
+            // 不敏感，`rm *` 的 deny 不许被 `RM -RF /x` 绕开。整工具规则
+            // （pattern == tool）保持精确匹配：工具名是注册表里的精确键。
+            if r.pattern == tool
+                || crate::tools::grep::wildcard_match(
+                    &scope.to_ascii_lowercase(),
+                    &r.pattern.to_ascii_lowercase(),
+                )
+            {
                 hit = Some(r);
             }
         }
@@ -338,7 +346,15 @@ impl RuleTable {
                         }
                     }
                     RuleAction::Ask => ask = true,
-                    RuleAction::Allow => allow = true,
+                    RuleAction::Allow => {
+                        if segment_allows_shortcut(seg) {
+                            allow = true;
+                        } else {
+                            // G29 安全收紧：替换语法/引号段不许 allow 短路，按未命中
+                            // 处理 —— allow+miss 折回默认路径（弹窗），绝不静默放行。
+                            miss = true;
+                        }
+                    }
                 },
                 None => miss = true,
             }
@@ -360,6 +376,21 @@ impl RuleTable {
     pub fn clear_tool_rules(&self) {
         crate::lock::write(&self.tool_rules).clear();
     }
+}
+
+/// G29：allow 短路的「干净段」判据。命中 allow 的段必须同时满足：
+/// · 不含命令替换语法（`$(`、反引号、`<(`）—— bash/git-bash/pwsh 会**实际执行**
+///   替换内容，`echo *` 的 allow 不许把 `echo $(calc)` 一起静默放走；
+/// · 不含任何引号（`'`/`"`）—— 切段器按 bash 语义配引号，cmd.exe 只认双引号，
+///   `echo 'x & calc'` 在 cmd 下是两条命令；引号段统一回落默认路径（弹窗）兜住
+///   跨 shell 的引号语义差。
+/// deny / ask 不受影响：它们按段原文匹配，替换语法照常命中、照常拒绝/询问。
+fn segment_allows_shortcut(seg: &str) -> bool {
+    !(seg.contains("$(")
+        || seg.contains('`')
+        || seg.contains("<(")
+        || seg.contains('\'')
+        || seg.contains('"'))
 }
 
 /// 一次调用实际覆盖的作用域令牌（R212：住在 gate，不住注册表）。
@@ -1899,6 +1930,57 @@ mod tests {
         let d = gate.check(&c, &CancellationToken::new()).await;
         assert_eq!(d, Decision::allow(Scope::Once), "{d:?}");
         assert!(sink.events().is_empty(), "规则 allow 不弹窗");
+    }
+
+    /// G29 安全收紧：命中 allow 的段若含命令替换语法（`$(`、反引号、`<(`）或引号，
+    /// 一律不许 allow 短路 —— 落默认路径（headless = deny），绝不静默放行。
+    #[tokio::test]
+    async fn substitution_or_quoted_segments_never_short_circuit_allow() {
+        for cmd in [
+            "echo $(calc)",
+            "echo `calc`",
+            "echo a'x & calc'b",
+            "echo \"a & calc\"",
+        ] {
+            let gate = PermissionGate::new();
+            gate.set_rules_from_json(&json!({
+                "run_command": [{"pattern": "echo *", "action": "allow"}]
+            }))
+            .unwrap();
+            let c = ToolCallView {
+                id: "c1".into(),
+                name: "run_command".into(),
+                risk: Risk::Exec,
+                input: json!({ "command": cmd }),
+            };
+            let d = gate.check(&c, &CancellationToken::new()).await;
+            assert!(
+                matches!(&d, Decision::Deny { reason } if reason.contains("没有可应答的界面")),
+                "替换/引号段不许被 allow 带过（{cmd}）：{d:?}"
+            );
+        }
+    }
+
+    /// G29：Exec 段的规则匹配按 ASCII 大小写折叠 —— cmd/PowerShell 命令名大小写
+    /// 不敏感，`rm *` 的 deny 不许被 `RM -RF /x` 绕开。
+    #[tokio::test]
+    async fn exec_rule_matching_is_ascii_case_insensitive() {
+        let gate = PermissionGate::new();
+        gate.set_rules_from_json(&json!({
+            "run_command": [{"pattern": "rm *", "action": "deny"}]
+        }))
+        .unwrap();
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: "run_command".into(),
+            risk: Risk::Exec,
+            input: json!({"command": "RM -RF /x"}),
+        };
+        let d = gate.check(&c, &CancellationToken::new()).await;
+        assert!(
+            matches!(&d, Decision::Deny { reason } if reason.contains("权限规则")),
+            "deny 规则对大写命令同样生效：{d:?}"
+        );
     }
 
     /// allow 段 + 未命中段 → 落默认路径：echo 段的 allow 不带过没有任何规则覆盖的
