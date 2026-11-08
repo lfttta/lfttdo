@@ -288,6 +288,9 @@ async fn run_command(command: &str, base: &Path) -> Result<(bool, String), ToolE
 /// 一次 git 调用：cwd = base，stdout 帽 512 KiB；非零退出 → Failed 带 stderr 尾。
 async fn git(base: &Path, args: &[&str]) -> Result<String, ToolError> {
     let out = Command::new("git")
+        // G29：钉死 autocrlf=false —— 快照/恢复承诺**字节级**往返；否则在
+        // core.autocrlf=true 的机器上 checkout 会把 LF 改写成 CRLF，破坏承诺。
+        .args(["-c", "core.autocrlf=false"])
         .args(args)
         .current_dir(base)
         .stdin(std::process::Stdio::null())
@@ -917,13 +920,27 @@ mod tests {
         assert_eq!(ledger[0]["primary"], "time");
     }
 
-    /// Windows 计数器命令（PowerShell 一行，经 cmd /C 原样透传）：每次执行自增并
-    /// 打印 —— cmd 没有 sh 的 `$()` 算术，纯 cmd 写法要靠 `call echo %%n%%` 的
-    /// 展开陷阱，晦涩易碎；windows-latest 必有 powershell.exe。Windows CI 上验证。
+    /// Windows 计数脚本：**写进 repo 后用 `-File` 执行**。命令行上不出现 `$` 与
+    /// 内嵌引号 —— `cmd /C`、Rust argv 转义（内嵌 `"` 变 `\"`）、PowerShell 的
+    /// 多层引号解析都碰不到它。内联写法 `powershell -Command "...$n..."` 会在
+    /// 传递链上被外层当未定义变量展开成空（G29 真机复现：所有 `$n` 变空串）。
     #[cfg(windows)]
-    const COUNTER_CMD: &str = "powershell -NoProfile -Command \"$n=0; \
-         if(Test-Path c.txt){$n=[int](Get-Content c.txt | Select-Object -First 1)}; \
-         $n=$n+1; Set-Content c.txt $n; Write-Output ('METRIC time='+$n)\"";
+    const COUNTER_PS1: &str = "$n = 0\n\
+         if (Test-Path c.txt) { $n = [int](Get-Content c.txt | Select-Object -First 1) }\n\
+         $n = $n + 1\n\
+         Set-Content c.txt $n\n\
+         Write-Output ('METRIC time=' + $n)\n";
+
+    /// Windows 计数器命令：每次执行自增并打印 METRIC。windows-latest 必有
+    /// powershell.exe；`-ExecutionPolicy Bypass` 保证 `-File` 不被策略拦下。
+    #[cfg(windows)]
+    const COUNTER_CMD: &str = "powershell -NoProfile -ExecutionPolicy Bypass -File counter.ps1";
+
+    /// Windows 用：把计数脚本落进 repo（`-File` 的目标，cwd 就是 repo）。
+    #[cfg(windows)]
+    fn seed_counter_script(repo: &Path) {
+        std::fs::write(repo.join("counter.ps1"), COUNTER_PS1).unwrap();
+    }
 
     /// 复跑取中位数：三次分别产出 1/2/3，中位数 2；每次复跑各记一行账本。
     #[cfg(unix)]
@@ -962,6 +979,7 @@ mod tests {
     #[tokio::test]
     async fn repeat_runs_record_each_iteration_and_report_the_median() {
         let (_dir, repo) = temp_git_repo();
+        seed_counter_script(&repo);
         let ctx = ctx_with(vec![repo.clone()], None);
         let tool = ExperimentTool::new();
         let out = tool
@@ -1035,6 +1053,7 @@ mod tests {
     #[tokio::test]
     async fn repeat_runs_emit_one_experiment_run_event_per_iteration_in_order() {
         let (_dir, repo) = temp_git_repo();
+        seed_counter_script(&repo);
         let sink = Arc::new(EventLog::default());
         let mut ctx = ctx_with(vec![repo.clone()], None);
         ctx.events = Some(sink.clone());

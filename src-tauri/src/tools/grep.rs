@@ -72,7 +72,13 @@ pub(crate) fn wildcard_match(name: &str, pattern: &str) -> bool {
 /// 统一由 `output_bound` 在出口限幅 —— 两套截断会互相抢活（单行截断把输出压到
 /// 限幅阈值之下，总限幅就永远不触发），而「截断」只该有一处实现、一个口径。
 fn match_line(path: &Path, line_no: usize, line: &str) -> String {
-    format!("{}:{}: {}", path.display(), line_no, line.trim_end())
+    // 路径展示统一正斜杠：跨平台输出一致（模型侧可预期），测试按 `/` 断言。
+    format!(
+        "{}:{}: {}",
+        path.display().to_string().replace('\\', "/"),
+        line_no,
+        line.trim_end()
+    )
 }
 
 /// 递归收集待搜文件。返回 (文件表, 被跳过的非文本文件数)。

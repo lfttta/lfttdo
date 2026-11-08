@@ -163,7 +163,7 @@ impl Tool for GlobTool {
             let Ok(rel) = file.strip_prefix(root_of(file, &roots)) else {
                 continue;
             };
-            let rel = rel.to_string_lossy();
+            let rel = rel.to_string_lossy().replace('\\', "/");
             if !re.is_match(&rel) {
                 continue;
             }
@@ -181,7 +181,8 @@ impl Tool for GlobTool {
         }
         let mut text: String = hits
             .iter()
-            .map(|p| p.display().to_string())
+            // 路径展示统一正斜杠：跨平台输出一致（模型侧可预期），glob 模式语法也以 `/` 分段。
+            .map(|p| p.display().to_string().replace('\\', "/"))
             .collect::<Vec<_>>()
             .join("\n");
         // 汇总与提示放最前（与 grep 同一布局：预览截断时提示必须还在）。

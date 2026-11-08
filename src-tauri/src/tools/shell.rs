@@ -1264,6 +1264,7 @@ mod tests {
 
     /// background:true 立即返回 task_id（不带命令输出），命令在后台跑完；
     /// 凭 task_id 轮询拿到全部输出，副作用照常发生。
+    #[cfg(unix)]
     #[tokio::test]
     async fn background_returns_a_task_reference_then_delivers_the_output() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1280,6 +1281,65 @@ mod tests {
                 }),
                 &ctx,
             )
+            .await
+            .unwrap();
+        let ToolOutput::Text { text } = out else {
+            panic!("run_command 只产出文本");
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "后台启动必须立即返回，实际 {:?}",
+            started.elapsed()
+        );
+        let i = text.find("task_id").expect("返回的是任务引用");
+        let id: String = text[i + "task_id".len()..]
+            .chars()
+            .skip_while(|c| !c.is_ascii_alphanumeric())
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        assert!(!id.is_empty(), "{text}");
+
+        // 未完成 → 运行中；轮询到完成 → 全部输出 + 副作用发生。
+        let mut fetched = String::new();
+        for _ in 0..60 {
+            let out = tool.execute(json!({ "task_id": id }), &ctx).await.unwrap();
+            let ToolOutput::Text { text } = out else {
+                panic!("run_command 只产出文本");
+            };
+            fetched = text;
+            if fetched.contains("已完成") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(fetched.contains("已完成"), "{fetched}");
+        assert!(fetched.contains("done"), "命令输出要随查询交付：{fetched}");
+        assert_eq!(std::fs::read_to_string(&out_file).unwrap(), "done");
+    }
+
+    /// Windows 镜像：默认 shell 换 cmd（多数 Windows 机器上 bash 预设不可用）。
+    /// 命令用纯 cmd 写法 —— `ping -n 2` 当约 1 秒延迟（stdin 是 null，timeout
+    /// 用不了）；`<nul set /p` 写文件不带换行（echo 会带 CRLF，破坏
+    /// 「文件内容 == done」断言）；`type` 把输出交给任务查询交付。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn background_returns_a_task_reference_then_delivers_the_output_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_file = tmp.path().join("out.txt");
+        let tool = ShellTool::new(catalog_with(Vec::new(), "cmd"));
+        let ctx = test_ctx(Some(tmp.path().to_path_buf()));
+
+        let started = std::time::Instant::now();
+        // 路径不加引号：临时目录路径无空格，而内嵌引号经 Rust argv 转义（\"）+
+        // cmd /s /c 剥引号后会弄坏重定向目标（真机复现：文件根本没写出来）。
+        // 文件写入必须放在**整条命令末尾**：set /p 的值会吃掉后续 ` & ` 前的
+        // 空格（真机复现：写成 "done "）——所以 stdout 的 done 由前置 echo 提供。
+        let cmd_text = format!(
+            r#"ping -n 2 127.0.0.1 >nul & echo done & <nul set /p x=done>{}"#,
+            out_file.display()
+        );
+        let out = tool
+            .execute(json!({ "command": cmd_text, "background": true }), &ctx)
             .await
             .unwrap();
         let ToolOutput::Text { text } = out else {
