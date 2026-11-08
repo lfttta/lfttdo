@@ -12,6 +12,7 @@ pub(crate) mod output_bound;
 pub mod question;
 pub mod read_file;
 pub mod registry;
+pub mod render_html;
 // run_command（agent 的 shell 执行工具）：2026-11-01 先交付接口契约桩，
 // spec 见 docs/superpowers/specs/2026-11-01-agent-shell-selection-design.md。
 pub mod shell;

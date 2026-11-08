@@ -112,6 +112,8 @@ describe("ipc commands", () => {
       // Shell 两键（Shell 切片）：Settings 的必填键随类型镜像加进来，取生产默认值。
       shells: [],
       default_shell: "bash",
+      // G31：权限模式（serde 恒序列化）—— 生产默认值 rules，仅补键。
+      permission_mode: "rules",
     });
     expect(invoke).toHaveBeenNthCalledWith(1, "settings_get");
     expect(invoke).toHaveBeenNthCalledWith(2, "settings_set", {
@@ -141,6 +143,8 @@ describe("ipc commands", () => {
         memory_embedding_model: "text-embedding-v3",
         shells: [],
         default_shell: "bash",
+        // G31：settings_set 载荷同样带上这一必填键（send 侧原样转交）。
+        permission_mode: "rules",
       },
     });
   });

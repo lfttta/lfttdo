@@ -67,6 +67,8 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   // 「带成别的值」由 Shell 切片的用例用非默认值另钉。
   shells: [],
   default_shell: "bash",
+  // G31：权限模式（serde 恒序列化）—— 生产默认值 rules；非默认值由控件切片另钉。
+  permission_mode: "rules",
   api_key_masked: null,
   corrupt_backup: null,
   ...p,
@@ -258,6 +260,7 @@ describe("SettingsPanel", () => {
       memory_prospective_window_hours: 24,
       memory_embedding_source: "endpoint",
       memory_embedding_model: "text-embedding-v3",
+      permission_mode: "rules",
       shells: [],
       default_shell: "bash",
     });
@@ -302,6 +305,17 @@ describe("SettingsPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: /保存/ }));
     await waitFor(() => expect(p.onSave).toHaveBeenCalled());
     expect(p.onSave.mock.calls[0][0].roots).toEqual([]);
+  });
+
+  // G31：权限模式下拉 —— 改档后随保存整表上送（它是面板有控件的键，不是 carry-through）。
+  it("sends the chosen permission_mode through a save", async () => {
+    const p = await setup();
+    fireEvent.change(screen.getByLabelText(/权限模式/), {
+      target: { value: "ask_all" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    expect(p.onSave.mock.calls[0][0].permission_mode).toBe("ask_all");
   });
 
   it("carries the fields it does not render through a save", async () => {

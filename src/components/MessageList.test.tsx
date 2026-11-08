@@ -34,6 +34,42 @@ describe("MessageList", () => {
     expect(bubble).toHaveAttribute("data-streaming", "true");
   });
 
+  // G32：render_html 工具卡 —— 原始 html 走沙箱 iframe 内嵌渲染，不再以 JSON
+  // 形态倾倒在 <pre> 里；「放大」只是给 iframe 换高度类，不离开聊天流。
+  it("renders the render_html tool card as a sandboxed iframe", () => {
+    const s = state({
+      turns: [
+        {
+          id: 1,
+          role: "assistant",
+          blocks: [
+            {
+              kind: "tool",
+              callId: "c1",
+              name: "render_html",
+              risk: "write",
+              input: { html: "<p><b>你好</b></p>", title: "卡片" },
+              status: "ok",
+              preview: "已渲染「卡片」（16 字节，静态 HTML…）",
+              images: [],
+              ms: 3,
+            },
+          ],
+        },
+      ],
+    });
+    render(<MessageList state={s} onRespond={() => {}} />);
+    const frame = screen.getByTitle("卡片");
+    expect(frame.tagName).toBe("IFRAME");
+    expect(frame).toHaveAttribute("sandbox", "");
+    expect(frame.getAttribute("src")).toContain(
+      encodeURIComponent("<p><b>你好</b></p>"),
+    );
+    expect(screen.queryByText(/"html"/)).toBeNull();
+    fireEvent.click(screen.getByText("放大"));
+    expect(frame).toHaveClass("expanded");
+  });
+
   // 链接点击必须交给外部打开命令，而不是让 WebView 导航走（远程页会替换应用页面）。
   it("routes markdown links through onOpenLink instead of navigating", () => {
     const onOpenLink = vi.fn();
@@ -488,7 +524,10 @@ describe("MessageList", () => {
     const user = container.querySelector('[data-role="user"]');
     const assistant = container.querySelector('[data-role="assistant"]');
     expect(user?.textContent).toBe("我说的话");
-    expect(assistant?.textContent).toBe("模型的回答");
+    // 2026-11-08 起 assistant 气泡里多一枚复制 chip（也是 article 的孩子），
+    // textContent 会多出「复制」两个字；这条闸的靶子是「文本落在正确的气泡里」，
+    // 所以正文改用 toContain，user 气泡（没有复制钮）保持全等，两头都钉着。
+    expect(assistant?.textContent).toContain("模型的回答");
   });
 
   // 要求 3：拒绝必须能在卡片里填理由，而且用的是行内 <input>（第 8 条红线：绝不用 prompt()）。

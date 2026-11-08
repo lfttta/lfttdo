@@ -4,7 +4,7 @@ import {
   MAX_IMAGES_PER_MESSAGE,
   type PendingImage,
 } from "./ImageStrip";
-import type { ContentBlock, SendBlock } from "../types";
+import type { ContentBlock, SendBlock, SkillsView } from "../types";
 
 /**
  * 从粘贴事件里挑出图片文件（R145：实现只许读 `items[i].type` 与 `getAsFile()`，
@@ -41,6 +41,7 @@ export function Composer({
   onStop,
   onNormalize,
   seed,
+  skillsLoader,
 }: {
   streaming: boolean;
   onSend: (blocks: SendBlock[]) => Promise<void>;
@@ -49,6 +50,8 @@ export function Composer({
   onNormalize: (bytes: ArrayBuffer) => Promise<ContentBlock>;
   /** 技能面板“用这个技能”的预填；每次点击换一个新对象（id 递增），同一句话也能再填一次。 */
   seed?: { id: number; text: string } | null;
+  /** G33：slash 技能菜单的数据来源（App 接 `api.skillsList`）；缺省 = 菜单不启用。 */
+  skillsLoader?: () => Promise<SkillsView>;
 }) {
   const [text, setText] = useState("");
   const [stopRequested, setStopRequested] = useState(false);
@@ -70,6 +73,14 @@ export function Composer({
    */
   const pendingRef = useRef<PendingImage[]>([]);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  // G33：slash 技能菜单。`slashQuery` 非 null = 菜单开着，值是斜杠后面的过滤词；
+  // 技能表在第一次打开时拉一次并只留启用项，之后走组件内缓存。
+  const [slashQuery, setSlashQuery] = useState<string | null>(null);
+  const [slashSkills, setSlashSkills] = useState<SkillsView["skills"] | null>(
+    null,
+  );
+  const [slashIndex, setSlashIndex] = useState(0);
+  const slashLoadedRef = useRef(false);
 
   useEffect(() => {
     if (!seed) return;
@@ -84,6 +95,51 @@ export function Composer({
   const pushPending = (img: PendingImage) => {
     pendingRef.current = [...pendingRef.current, img];
     setPending(pendingRef.current);
+  };
+
+  /**
+   * G33：输入框第 0 位是 `/` 且后面还没有空白 ⇒ 菜单开着，query 是斜杠后的词。
+   * 只认第 0 位：正文里写到「/etc/hosts」这类路径不该弹菜单。技能表懒加载一次，
+   * 失败按空表处理（菜单开着但为空不报错 —— 技能坏了不该挡住打字）。
+   */
+  const syncSlashFrom = (value: string) => {
+    const m = /^\/([^\s]*)$/.exec(value);
+    if (m === null) {
+      setSlashQuery(null);
+      return;
+    }
+    if (!slashLoadedRef.current && skillsLoader) {
+      slashLoadedRef.current = true;
+      skillsLoader()
+        .then((view) => setSlashSkills(view.skills.filter((s) => s.enabled)))
+        .catch(() => setSlashSkills([]));
+    }
+    setSlashQuery(m[1]);
+    setSlashIndex(0);
+  };
+
+  const slashMatches =
+    slashQuery === null || slashSkills === null
+      ? []
+      : slashSkills.filter((s) => {
+          const q = slashQuery.toLowerCase();
+          return (
+            q === "" ||
+            s.name.toLowerCase().includes(q) ||
+            s.description.toLowerCase().includes(q)
+          );
+        });
+
+  /** 选中即填入与技能面板同一格式的引导语（App 的 `使用「名」技能：`），光标落在句尾。 */
+  const applySlash = (name: string) => {
+    const filled = `使用「${name}」技能：`;
+    setSlashQuery(null);
+    setText(filled);
+    const el = inputRef.current;
+    if (el) {
+      el.focus();
+      el.setSelectionRange(filled.length, filled.length);
+    }
   };
 
   /**
@@ -324,6 +380,33 @@ export function Composer({
           onRemove={removePending}
           onPick={(files) => void addFiles(files)}
         />
+        {slashQuery === null || slashMatches.length === 0 ? null : (
+          <div className="slash-menu" role="listbox" aria-label="技能快捷菜单">
+            {slashMatches.map((s, i) => (
+              <button
+                type="button"
+                key={s.name}
+                role="option"
+                aria-selected={i === Math.min(slashIndex, slashMatches.length - 1)}
+                className={
+                  i === Math.min(slashIndex, slashMatches.length - 1)
+                    ? "slash-item active"
+                    : "slash-item"
+                }
+                // mousedown 而不是 click：先于 textarea 失焦执行并挡掉默认的夺焦，
+                // 焦点留在输入框，光标位置由 applySlash 安排（onBlur 关菜单才不误伤）。
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  applySlash(s.name);
+                }}
+                onMouseEnter={() => setSlashIndex(i)}
+              >
+                <span className="slash-name">/{s.name}</span>
+                <span className="slash-desc">{s.description}</span>
+              </button>
+            ))}
+          </div>
+        )}
         <div className="composer-row">
           <textarea
             ref={inputRef}
@@ -333,8 +416,35 @@ export function Composer({
             disabled={streaming}
             rows={3}
             placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => {
+              setText(e.target.value);
+              syncSlashFrom(e.target.value);
+            }}
             onKeyDown={(e) => {
+              // G33：slash 菜单开着时键盘先归菜单 —— ↑↓ 移动、Enter 选中、Esc 关闭。
+              // Enter 与发送共用同一道 IME 守卫：候选框里的回车是选词，不是确认。
+              if (slashQuery !== null && slashMatches.length > 0) {
+                if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault();
+                  const delta = e.key === "ArrowDown" ? 1 : -1;
+                  setSlashIndex(
+                    (i) => (i + delta + slashMatches.length) % slashMatches.length,
+                  );
+                  return;
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setSlashQuery(null);
+                  return;
+                }
+                if (e.key === "Enter" && !e.shiftKey) {
+                  if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+                  e.preventDefault();
+                  const pick = slashMatches[Math.min(slashIndex, slashMatches.length - 1)];
+                  applySlash(pick.name);
+                  return;
+                }
+              }
               // 中文输入法的候选框里按 Enter 是**选词**，不是发送：`isComposing`
               // （以及老 WebView 的 keyCode 229）必须放过，否则打「你好」按回车就发出去半个词。
               if (e.key !== "Enter" || e.shiftKey) return;
@@ -342,6 +452,7 @@ export function Composer({
               e.preventDefault();
               void submit();
             }}
+            onBlur={() => setSlashQuery(null)}
           />
           {streaming ? (
             <button

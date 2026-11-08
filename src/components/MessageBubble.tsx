@@ -1,4 +1,5 @@
-import { memo, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import Markdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
@@ -39,6 +40,70 @@ export function readablePreview(text: string): string {
     .filter((line) => !line.trimStart().startsWith("[未能定界出正文"))
     .join(NL)
     .trim();
+}
+
+/** 复制反馈在屏上停留的毫秒数：读得清「已复制」三个字就够了，不占第二处注意力。 */
+const COPY_FEEDBACK_MS = 1_500;
+
+/**
+ * 复制 chip 的共用实现（气泡右上角与代码块右上角两个落点）。
+ * 成败都必须出声（R195 的口径：静默丢反馈等于界面说谎），但两者都只值一句瞬时文案：
+ * 成功「已复制」、失败「复制失败」，1.5 秒后回到「复制」。计时器卸载时清掉 ——
+ * 留着的 setTimeout 会在一个已经不存在的组件上 setState（App 的 memoryToastTimer
+ * 同一条纪律，症状是测试之间互相串）。
+ * `navigator.clipboard` 在非安全上下文里不存在：`?.` 短路后按「失败」处理并出声，
+ * 不许静默 —— 用户以为复制了、粘出来是别的东西，比报错更糟。
+ * `getText` 是**点击那一刻**才取的取数函数：代码块从 DOM 读 `textContent`，
+ * 引用循环里造的闭包不影响 memo 化的外层（这一层是独立组件，状态自成一体）。
+ */
+function CopyButton({ getText, testId }: { getText: () => string; testId: string }) {
+  const [state, setState] = useState<"idle" | "done" | "fail">("idle");
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (timer.current !== null) {
+        clearTimeout(timer.current);
+        timer.current = null;
+      }
+    },
+    [],
+  );
+  const copy = useCallback(() => {
+    const settled = (ok: boolean) => setState(ok ? "done" : "fail");
+    const promise = navigator.clipboard?.writeText(getText());
+    if (promise === undefined) settled(false);
+    else promise.then(() => settled(true), () => settled(false));
+    // 连续第二次点击重置计时：上一次的「已复制」不该把这一次的存活时间一起带走。
+    if (timer.current !== null) clearTimeout(timer.current);
+    timer.current = setTimeout(() => {
+      setState("idle");
+      timer.current = null;
+    }, COPY_FEEDBACK_MS);
+  }, [getText]);
+  return (
+    <button type="button" className="copy-chip" data-testid={testId} onClick={copy}>
+      {state === "done" ? "已复制" : state === "fail" ? "复制失败" : "复制"}
+    </button>
+  );
+}
+
+/**
+ * 代码块的复制按钮挂在 `pre` 的包装层（`.md-code`）上，按钮从 DOM 读 `textContent`：
+ * 高亮（rehype-highlight）把代码拆成一堆 span，`textContent` 是唯一「拿到的就是源码」
+ * 的读法，不必去解析 markdown AST。包装层只加 `position: relative` 与这枚按钮，
+ * `pre` 本体不动 —— `.md pre` 的样式与滚动行为都照旧。
+ */
+function CodeBlock({ children }: { children?: ReactNode }) {
+  const ref = useRef<HTMLPreElement>(null);
+  return (
+    <div className="md-code">
+      <pre ref={ref}>{children}</pre>
+      <CopyButton
+        testId="code-copy"
+        getText={() => ref.current?.textContent ?? ""}
+      />
+    </div>
+  );
 }
 
 function PathChip({
@@ -83,6 +148,9 @@ function ToolCardView({
   onRevealPath?: (path: string) => void;
 }) {
   const path = toolPathOf(card.input);
+  // G32：render_html 有专属卡片 —— 原始 html 不再以 JSON 形式倾倒在 <pre> 里，
+  // 改为沙箱 iframe 内嵌显示（输出文本里的落盘路径仍由下面的 preview 行展示）。
+  const render = card.name === "render_html" ? renderInputOf(card.input) : null;
   return (
     <div
       className="card tool"
@@ -98,9 +166,13 @@ function ToolCardView({
       {path === null ? null : (
         <PathChip path={path} onReveal={onRevealPath} />
       )}
-      <pre className="io">
-        {JSON.stringify(card.input ?? {}, null, 2)}
-      </pre>
+      {render === null ? (
+        <pre className="io">
+          {JSON.stringify(card.input ?? {}, null, 2)}
+        </pre>
+      ) : (
+        <RenderedHtmlCard html={render.html} title={render.title} />
+      )}
       {(() => {
         const shown = card.preview ? readablePreview(card.preview) : "";
         return shown !== "" ? <pre className="io preview">{shown}</pre> : null;
@@ -146,6 +218,51 @@ function writeInputOf(input: unknown): WriteInput | null {
     return null;
   }
   return { path: o.path, content: o.content };
+}
+
+type RenderInput = { html: string; title: string | null };
+
+/** G32：render_html 的入参守门 —— html 必须是非空字符串；title 缺席/空白归一成 null。 */
+function renderInputOf(input: unknown): RenderInput | null {
+  const o = asRecord(input);
+  if (o === null || typeof o.html !== "string" || o.html.trim() === "") {
+    return null;
+  }
+  const t = o.title;
+  return {
+    html: o.html,
+    title: typeof t === "string" && t.trim() !== "" ? t : null,
+  };
+}
+
+/**
+ * G32：render_html 的内嵌渲染。`sandbox=""` 是整个安全模型的落点：独立源、禁脚本、
+ * 禁表单 —— 交付物只能是静态 HTML/CSS/SVG。data URL 让零配置的本地渲染成为可能
+ * （不启 asset 协议、不加 IPC 读回命令）；「放大」只改高度，不离开聊天流。
+ */
+function RenderedHtmlCard({ html, title }: { html: string; title: string | null }) {
+  const [expanded, setExpanded] = useState(false);
+  const src = `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+  return (
+    <div className="rendered-html" data-testid="rendered-html">
+      {title === null ? null : <div className="rendered-title">{title}</div>}
+      <iframe
+        className={expanded ? "rendered-frame expanded" : "rendered-frame"}
+        sandbox=""
+        src={src}
+        title={title ?? "渲染结果"}
+      />
+      <div className="rendered-foot">
+        <button
+          type="button"
+          className="rendered-toggle"
+          onClick={() => setExpanded((v) => !v)}
+        >
+          {expanded ? "收起" : "放大"}
+        </button>
+      </div>
+    </div>
+  );
 }
 
 function editInputOf(input: unknown): EditInput | null {
@@ -364,6 +481,7 @@ function BlockView({
                       {children}
                     </a>
                   ),
+                  pre: CodeBlock,
                 }}
               >
                 {answer}
@@ -392,6 +510,19 @@ function BlockView({
   }
 }
 
+/**
+ * 这条轮次里可复制的文本：只有 text 块，且只取**回答**部分 —— 思考过程（`<think>`）
+ * 在屏上收在折叠区里，复制出来的东西应该和用户读到的一致；工具卡/权限卡不是文本，
+ * 不进剪贴板。多块按顺序用空行接起来。
+ */
+function copyTextOf(turn: Turn): string {
+  return turn.blocks
+    .filter((b): b is Extract<UiBlock, { kind: "text" }> => b.kind === "text")
+    .map((b) => splitThinking(b.text).answer)
+    .filter((s) => s.trim() !== "")
+    .join("\n\n");
+}
+
 function MessageBubbleView({
   turn,
   isLastTurn,
@@ -411,6 +542,11 @@ function MessageBubbleView({
   // R234：空的助手气泡有两种来路 —— 等首字（该留着并看得出在等）与这一轮已结束
   // （401、中断，该收起）。样式分不出「空且还在跑」和「空且已经死」，所以在这里打标。
   const inFlight = streaming && isLastTurn && turn.role === "assistant";
+  // 复制按钮只在「这一轮已经写完」的 assistant 气泡上出现：流式进行中复制到的是
+  // 半截话，而且按钮悬在正在生长的气泡右上角会一直晃。等 `done` 再现身。
+  // 空气泡没有可复制的东西，按钮也不渲染 —— 否则 `.bubble…:empty` 的两条
+  // 隐藏/占位规则（R234）会被一个空按钮打破。
+  const copyText = turn.role === "assistant" && !inFlight ? copyTextOf(turn) : "";
   return (
     <article
       className={`bubble bubble-${turn.role}`}
@@ -428,6 +564,9 @@ function MessageBubbleView({
           onRevealPath={onRevealPath}
         />
       ))}
+      {copyText === "" ? null : (
+        <CopyButton testId="bubble-copy" getText={() => copyText} />
+      )}
     </article>
   );
 }

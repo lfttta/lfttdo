@@ -24,6 +24,8 @@ const h = vi.hoisted(() => {
     renameSession: vi.fn(),
     replaySession: vi.fn(),
     getSettings: vi.fn(),
+    // G33：Composer 的 slash 技能菜单要读这个键（App 原样传 `api.skillsList`）。
+    skillsList: vi.fn(),
     setSettings: vi.fn(),
     setApiKey: vi.fn(),
     normalize: vi.fn(),
@@ -91,6 +93,8 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   memory_embedding_model: "text-embedding-v3",
   shells: [],
   default_shell: "bash",
+  // G31：权限模式（serde 恒序列化）—— 生产默认值 rules，仅补键。
+  permission_mode: "rules",
   api_key_masked: null,
   corrupt_backup: null,
   ...p,

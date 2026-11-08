@@ -27,6 +27,8 @@ const h = vi.hoisted(() => {
     renameSession: vi.fn(),
     replaySession: vi.fn(),
     getSettings: vi.fn(),
+    // G33：Composer 的 slash 技能菜单要读这个键（App 原样传 `api.skillsList`）。
+    skillsList: vi.fn(),
     setSettings: vi.fn(),
     setApiKey: vi.fn(),
     normalize: vi.fn(),
@@ -119,6 +121,8 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   // label 留空顺带钉住「自定义 profile 的显示名可空」这条线上语义（types.ts / spec §5.2）。
   shells: [{ id: "mine", label: "", program: "/opt/mine", args: ["-c"] }],
   default_shell: "pwsh",
+  // G31：非默认值（Rust 默认 rules）—— 下面 settings_set 载荷断言要能看出「原样转交」。
+  permission_mode: "ask_all",
   api_key_masked: null,
   corrupt_backup: null,
   ...p,
@@ -336,6 +340,8 @@ describe("App 设置接线", () => {
         // Shell 两键原样转交：App 不重拼默认表（夹具给的是非默认值，重拼了这里当场红）。
         shells: [{ id: "mine", label: "", program: "/opt/mine", args: ["-c"] }],
         default_shell: "pwsh",
+        // G31：权限模式同样原样转交（夹具给的是非默认 ask_all）。
+        permission_mode: "ask_all",
       }),
     );
     // 保存成功才改界面：这三项是 `applyTheme` 唯一的三个可见后果。
