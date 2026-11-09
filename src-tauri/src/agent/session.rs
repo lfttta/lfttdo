@@ -2739,8 +2739,13 @@ mod tests {
     /// 一个只读的「命令」替身：记下自己收到的入参，Read 档（零弹窗）。
     /// hooks 的改写要在 Read 档工具上测 —— 那样弹窗不会掺进来，断言只看「工具实际
     /// 收到了什么」。
+    ///
+    /// `#[cfg(windows)]`：只有跑真 `.cmd` 脚本的 hook 测试用它。不挂 cfg 时
+    /// Linux clippy（CI 的 `-D warnings`）会以 `never constructed` 报死代码。
+    #[cfg(windows)]
     struct RecordingTool(Arc<Mutex<Vec<serde_json::Value>>>);
 
+    #[cfg(windows)]
     #[async_trait]
     impl Tool for RecordingTool {
         fn meta(&self) -> ToolMeta {
@@ -2767,8 +2772,12 @@ mod tests {
     /// 同上但 **Exec 档**：走权限门的 `RuleOutcome` 路径（Exec 才有命令分段判定）。
     /// 「改写后的命令要被 deny 规则拦住」这条只能在 Exec 档上测 —— Write 档的匹配串
     /// 是 `path`，跑不出 `rm *` 这条规则。
+    ///
+    /// `#[cfg(windows)]`：理由同 [`RecordingTool`]（Linux clippy 会报 never constructed）。
+    #[cfg(windows)]
     struct ExecRecordingTool(Arc<Mutex<Vec<serde_json::Value>>>);
 
+    #[cfg(windows)]
     #[async_trait]
     impl Tool for ExecRecordingTool {
         fn meta(&self) -> ToolMeta {
