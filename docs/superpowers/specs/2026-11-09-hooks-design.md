@@ -77,9 +77,15 @@ stdin 收一个 JSON 对象，stdout 回一个 JSON 对象（**stdout 只承载�
 | 文件 | 内容 |
 |---|---|
 | `src-tauri/src/hooks.rs`（新） | 声明解析、digest、信任表、子进程执行、输出解析（纯逻辑，不 `use tauri`） |
-| `src-tauri/src/agent/session.rs` | `SessionDeps.hooks`；`PreToolUse` 在权限门**之后**、执行**之前**；`PostToolUse` 在结果产生后 |
-| `src-tauri/src/ipc.rs` | 装配（读 hooks.json + 信任表）、4 条命令：`hooks_list` / `hooks_trust` / `hooks_revoke` / `hooks_open_folder`；`SessionStart`/`Stop` 发在 `run_turn` 两端 |
-| `src/components/HooksPanel.tsx`（新） | 列表 + 每条的状态（已信任/未信任）+ 信任/撤销按钮 + 打开文件夹 |
+| `src-tauri/src/agent/session.rs` | `SessionConfig.hooks: Option<HookRuntime>`；`PreToolUse` 在权限门**之前**（可先拦下，省一次无意义弹窗）、执行**之前**；`PostToolUse` 在结果产生后；`SessionStart` 在 `run()` 开头；`Stop` 在 `finish()`（`AtomicBool` 防重） |
+| `src-tauri/src/ipc.rs` | 装配（读 hooks.json + 信任表）；命令：`hooks_list` / `hooks_set_trusted` / `hooks_open_folder`（后两条 v0.2.0 重切时加 `session_id`，`hooks_list` 还要按会话查工作区）+ `hooks_set_workspace_enabled` |
+| `src/components/HooksPanel.tsx`（新） | 用户作用域 / 工作区级两段；逐条信任/撤销；总开关（独立动作 + 二次确认）；打开对应目录 |
+
+> **实际落点与本节最初草案的差异**（如实记录，不回头改历史）：
+> ① `PreToolUse` 最终放在权限门**之前**而不是之后 —— 用户 hook 先拦能省掉一次无意义弹窗，
+> 且 deny 的呈现复用「工具结果 is_error」那条既有路径；② 命令由草案的 4 条收成 3 条
+> （`hooks_trust` + `hooks_revoke` 合并为带 `trusted: bool` 的 `hooks_set_trusted`）；
+> ③ `SessionConfig` 而不是 `SessionDeps` —— 后者全仓有 17 处字面量构造，加字段是破坏性的。
 
 ## 验收（测试钉住的项）
 
