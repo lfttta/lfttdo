@@ -292,26 +292,43 @@ async function judge(c, result, profileDir) {
 
 async function main() {
   const all = JSON.parse(await readFile(casesFile, "utf8"));
-  const cases = only ? all.cases.filter((c) => c.name === only) : all.cases;
-  if (cases.length === 0) {
+  const picked = only ? all.cases.filter((c) => c.name === only) : all.cases;
+  if (picked.length === 0) {
     console.error(only ? `没有名为 ${only} 的用例` : "案例集是空的");
     process.exit(2);
   }
   const fp = await fingerprint();
-  console.log(`评测 ${cases.length} 条用例`);
-  console.log(`  代码：${fp.git_sha}${fp.dirty ? "（工作区有未提交改动）" : ""}`);
-  console.log(`  版本：${fp.version} · ${fp.platform} · node ${fp.node}`);
 
   const baseUrl = all.endpoint?.base_url ?? "http://127.0.0.1:11434/v1";
   const model = all.endpoint?.model ?? null;
+  // 「这条是会话层吗」只看用例**自身**的声明，与命令行开关无关 —— 开关决定的是
+  // 「跑不跑」，不是「算什么」。把两者混在一起会让 `--boot-only` 把会话用例静默
+  // 降级成「起个 GUI 看它活不活」，那既不是它们要验的东西，还会给出一个假绿灯。
   const isSessionCase = (c) =>
-    !bootOnly && c.boot_only !== true && typeof c.prompt === "string" && c.prompt.length > 0;
+    c.boot_only !== true && typeof c.prompt === "string" && c.prompt.length > 0;
+  const skipped = bootOnly ? picked.filter(isSessionCase) : [];
+  // boot-only 时**剔除**会话用例（而不是降级），剩下的才是这一轮要跑的。
+  const cases = bootOnly ? picked.filter((c) => !isSessionCase(c)) : picked;
+  if (cases.length === 0) {
+    console.error(
+      `--boot-only 下没有可跑的启动层用例` +
+        (only ? `（${only} 是会话层用例，去掉 --boot-only 再跑）` : ""),
+    );
+    process.exit(2);
+  }
   const sessionCases = cases.filter(isSessionCase);
+
+  console.log(`评测 ${cases.length} 条用例` + (skipped.length > 0 ? `（跳过 ${skipped.length} 条会话层）` : ""));
+  console.log(`  代码：${fp.git_sha}${fp.dirty ? "（工作区有未提交改动）" : ""}`);
+  console.log(`  版本：${fp.version} · ${fp.platform} · node ${fp.node}`);
 
   if (dry) {
     for (const c of cases) {
       const kind = isSessionCase(c) ? "会话层" : "启动层";
       console.log(`  - [${kind}] ${c.name}：${c.prompt ?? "（只验冷启动）"}`);
+    }
+    for (const c of skipped) {
+      console.log(`  - [跳过] ${c.name}（--boot-only）`);
     }
     console.log(`\n端点：${baseUrl}${model ? ` · 模型 ${model}` : ""}`);
     if (sessionCases.length > 0) {

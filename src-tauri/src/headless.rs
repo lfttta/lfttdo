@@ -31,11 +31,11 @@
 use crate::agent::events::AgentEvent;
 use crate::agent::session::{AgentSession, SessionConfig, SessionDeps};
 use crate::agent::types::ContentBlock;
-use crate::permission::gate::{PermissionGate, Verdict};
+use crate::permission::gate::PermissionGate;
 use crate::settings::SettingsStore;
 use crate::store::db::Db;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// `--headless` 之外的参数是否被本模块接管。
@@ -362,18 +362,6 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
 #[cfg(test)]
 fn endpoint_missing(settings: &crate::settings::Settings) -> bool {
     settings.base_url.trim().is_empty()
-}
-
-/// 让 `Verdict` 的导入不算未使用（headless 的 server 信任回灌要用它的类型面）。
-#[allow(dead_code)]
-fn _verdict_marker() -> Option<Verdict> {
-    None
-}
-
-/// 路径存在且是目录（评测的 `--data-dir` 校验用）。
-#[allow(dead_code)]
-fn is_dir(p: &Path) -> bool {
-    p.is_dir()
 }
 
 #[cfg(test)]
