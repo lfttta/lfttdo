@@ -81,6 +81,33 @@ npm run lint:css      # 注意它**排除** theme/tokens.css 与 theme/presets.c
   正确做法：`git rev-parse HEAD:<path>` 取 sha，远端已有该 blob 就直接引用，没有才用
   `git cat-file` 取字节上传。曾经读工作区字节把 `main.rs` 与 eval 种子推成了 CRLF，
   同目录其它 `.rs` 是 LF——功能无差别，但一个目录混两种行尾是真实的卫生问题。
+
+### 编码纪律（踩过一次最严重的事故：12 条 commit 消息被毁）
+
+PowerShell 5.1 的 `$OutputEncoding` 默认是 **US-ASCII (cp20127)**。把含中文的字符串
+**管道给原生 exe**（`$json | gh api --input -`）时，每个非 ASCII 字符都变成 `?`。
+后果：本地 commit 消息完好，**推上去的全成了 `docs: AGENTS.md ? hooks ??????????`**。
+此类损坏**不可逆** —— 远端对象里只剩 0x3f 字节，原文字节已不在。
+
+所以：
+
+1. **绝不把 JSON 管道给 `gh`**。写 UTF-8 文件，用 `--input <file>`：
+   ```powershell
+   [IO.File]::WriteAllText($f, $json, (New-Object Text.UTF8Encoding $false))
+   gh api ... --method POST --input $f
+   ```
+2. **`ConvertTo-Json` 在 PS 5.1 下也会毁中文**（实测 `消息` → `?`）。要构造含中文的
+   JSON，用手写 `JsonEscape`（见下表），或干脆用 `git log -1 --format=%B` 读原文再逐字符转义。
+3. **`cmd /c "... > file"` 重定向会多出 / 吃掉行尾字节**：拿 blob 用
+   `git cat-file -p <rev>` 重定向后用 `git cat-file -s <rev>` 校验长度。
+4. **`.ps1` 脚本里不要写中文**。PowerShell 5.1 按 GBK 读脚本文件，UTF-8 中文注释会
+   把字符串解析打断（表现为「表达式或语句中包含意外的标记」）。中文只放**数据文件**。
+5. **推送后必查三件事**（缺一不可）：
+   - `gh api repos/<r>/git/commits/<sha>` 的 `message` 与本地 `git log -1 --format=%B` 一致
+   - 远端 blob sha == 本地 `git rev-parse HEAD:<path>`
+   - 关键新文件在 `git/trees/<tree>` 里
+
+> 修复这类损坏的代价很高（要重建整条链 + force push）。**宁可多写一个文件，也不要管道给 gh。**
 - **推送后必须验证远端内容**，不能只看 PATCH 返回成功：
   - 关键新文件在不在：`gh api repos/<r>/contents/<path>` 逐条查（`?ref=main` 在 PowerShell 里
     会被引号吃掉，用 `--jq .sha` 或分变量拼 URL）
