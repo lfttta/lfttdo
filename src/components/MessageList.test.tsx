@@ -214,6 +214,104 @@ describe("MessageList", () => {
     expect(screen.queryByTestId("followup-strip")).toBeNull();
   });
 
+  // G40+：widgetState 双分区 —— 页面保存的 modelContent 会跟着下一次 followup 一起
+  // 出现在确认条上（用户看得见"页面带着什么状态想说话"）；privateContent 不进文字。
+  it("G40+: page state rides along with the follow-up but private content does not", () => {
+    const onFollowUp = vi.fn();
+    const s = state({
+      turns: [
+        {
+          id: 1,
+          role: "assistant",
+          blocks: [
+            {
+              kind: "tool",
+              callId: "c1",
+              name: "render_html",
+              risk: "write",
+              input: { html: "<p>x</p>" },
+              status: "ok",
+              preview: "",
+              images: [],
+              ms: 1,
+            },
+          ],
+        },
+      ],
+    });
+    render(
+      <MessageList state={s} onRespond={() => {}} onFollowUp={onFollowUp} />,
+    );
+    const frame = screen.getByTitle("渲染结果") as HTMLIFrameElement;
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          source: frame.contentWindow,
+          data: {
+            type: "lfttdo:state",
+            modelContent: "用户选了方案A",
+            privateContent: { scrollTop: 420, collapsed: ["s3"] },
+          },
+        }),
+      );
+    });
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          source: frame.contentWindow,
+          data: { type: "lfttdo:followup", prompt: "按方案A继续" },
+        }),
+      );
+    });
+    const strip = screen.getByTestId("followup-strip");
+    // modelContent 进确认条（人审时看得见它是带着什么状态来的）。
+    expect(strip).toHaveTextContent("按方案A继续");
+    expect(strip).toHaveTextContent("[页面状态] 用户选了方案A");
+    // privateContent（滚动位置/折叠态）一个字都不该上屏。
+    expect(strip).not.toHaveTextContent("scrollTop");
+    expect(strip).not.toHaveTextContent("420");
+  });
+
+  // G40+：页面状态回灌进重挂的 iframe —— 刷新/重挂后页面能读 `window.__lfttdo_state`
+  // 恢复界面（data URL 是全新文档，没有别的通道能带过去）。
+  it("G40+: a saved state is rehydrated into the frame document", () => {
+    const s = state({
+      turns: [
+        {
+          id: 1,
+          role: "assistant",
+          blocks: [
+            {
+              kind: "tool",
+              callId: "c1",
+              name: "render_html",
+              risk: "write",
+              input: { html: "<html><head></head><body>x</body></html>" },
+              status: "ok",
+              preview: "",
+              images: [],
+              ms: 1,
+            },
+          ],
+        },
+      ],
+    });
+    render(<MessageList state={s} onRespond={() => {}} />);
+    const frame = screen.getByTitle("渲染结果") as HTMLIFrameElement;
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          source: frame.contentWindow,
+          data: { type: "lfttdo:state", modelContent: null, privateContent: { page: 3 } },
+        }),
+      );
+    });
+    const src = screen.getByTitle("渲染结果").getAttribute("src") ?? "";
+    const decoded = decodeURIComponent(src);
+    expect(decoded).toContain("__lfttdo_state");
+    expect(decoded).toContain('"privateContent":{"page":3}');
+  });
+
   // G40：别的窗口/iframe 冒充 source 的消息被忽略 —— 校验不过就不出确认条。
   it("G40: a follow-up from a foreign source is ignored", () => {
     const s = state({

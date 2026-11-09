@@ -103,6 +103,10 @@ pub struct SessionConfig {
     /// 主会话这一轮，子代理是谁、能干什么，是派活那一刻才定的事。Default 空表 =
     /// 无档案可点名，task 的行为与从前逐字节一致。
     pub agents: Vec<AgentProfile>,
+    /// G44：hooks 配置与信任表所在目录（数据目录）。`None` = 不跑 hooks。
+    /// 放 `SessionConfig` 而不是 `SessionDeps` 字段：本结构全仓都用
+    /// `..Default::default()` 构造（见 `ipc.rs` 装配点），加字段零破坏面。
+    pub hooks_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for SessionConfig {
@@ -114,6 +118,7 @@ impl Default for SessionConfig {
             allowed_tools: None,
             active_agent_name: None,
             agents: Vec::new(),
+            hooks_dir: None,
         }
     }
 }
@@ -162,6 +167,12 @@ pub struct AgentSession {
     /// 本轮已经自动加载过正文的技能：`(展示名, [小写技能名, 小写文件夹名])`。
     /// 只服务一件事 —— 模型再喊一次 `use_skill` 时不重读，回一句提示。
     turn_skills: Vec<(String, Vec<String>)>,
+    /// G44：Stop hook 是否已触发（`finish` 有多条出口路径，只该跑一次）。
+    /// `AtomicBool` 而不是 `Cell`：本结构的 future 要跨线程 Send（`send_message`
+    /// 是 tauri 命令），`Cell` 不是 Sync。
+    stop_hook_fired: std::sync::atomic::AtomicBool,
+    /// G44：SessionStart hook 的附加上下文（本轮的系统备注，随请求头发给模型）。
+    startup_notes: Vec<String>,
     /// 本轮**用户原话**（`run()` 入口那一句）。不能用「最近一条 user 消息」代替：
     /// 工具返回图片时 `image_followup` 会再补一条 user 轮，那样会让技能在第二次请求里
     /// 突然从上下文消失。
@@ -319,6 +330,8 @@ impl AgentSession {
             turn_user_text: String::new(),
             last_est_input: 0,
             defer_done: false,
+            stop_hook_fired: std::sync::atomic::AtomicBool::new(false),
+            startup_notes: Vec::new(),
         }
     }
 
@@ -402,6 +415,29 @@ impl AgentSession {
         // 取消发生在开始之前：这一轮压根没发生，连 user 消息都不该留下（R63 的第二条 run 同理）。
         if self.cancel.is_cancelled() {
             return self.finish(StopReason::Interrupted);
+        }
+        // G44 SessionStart：每轮开始前跑（用户的"会话开始"语义 = 一轮对话的开始，
+        // 与 ZCode 的 SessionStart 同义）。它的 additional_context 落成本轮的第一条
+        // 系统备注 —— 模型在第一次请求里就能读到。
+        if let Some(dir) = &self.cfg.hooks_dir {
+            let input = crate::hooks::HookInput {
+                event: "SessionStart",
+                session_id: "",
+                cwd: crate::hooks::cwd_string(),
+                tool: None,
+            };
+            let (hooked, diags) =
+                crate::hooks::run_event(dir, crate::hooks::HookEvent::SessionStart, None, &input);
+            for d in diags {
+                self.deps.sink.emit(AgentEvent::Error {
+                    at: ErrorWhere::Tool,
+                    message: format!("hook 诊断：{d}"),
+                    fatal: false,
+                });
+            }
+            if let Some(extra) = hooked.additional_context {
+                self.startup_notes.push(extra);
+            }
         }
         let user = Message::user(blocks);
         // 「本轮已加载」和「用户原话」都是**这一轮**的事：下一轮重新按那句话决定。
@@ -611,9 +647,69 @@ impl AgentSession {
                     None
                 };
                 let started = Instant::now();
+                // G44：PreToolUse 的附加上下文（本工具的 hook 给的），并进结果尾部。
+                let mut hook_context: Option<String> = None;
                 let (output, is_error) = match already {
                     Some(note) => (ToolOutput::text(note), false),
                     None => {
+                        // G44 PreToolUse：在权限门**之前**跑（用户 hook 可以先拦下，
+                        // 省掉一次无意义的弹窗）。deny 的呈现走与权限门同一条路：
+                        // 结果作为 is_error 回给模型，理由就是 hook 给的那句话。
+                        if let Some(dir) = &self.cfg.hooks_dir {
+                            // session_id 归外层（`AgentSession` 不持会话 id：它是
+                            // 一轮编排者，落库/会话归属全在 ipc 侧）。hook 拿空串 ——
+                            // 需要归属的脚本应改用 cwd 或自己的环境变量。
+                            let input = crate::hooks::HookInput {
+                                event: "PreToolUse",
+                                session_id: "",
+                                cwd: crate::hooks::cwd_string(),
+                                tool: Some(crate::hooks::ToolPayload {
+                                    name: &name,
+                                    input: &input,
+                                }),
+                            };
+                            let (hooked, diags) = crate::hooks::run_event(
+                                dir,
+                                crate::hooks::HookEvent::PreToolUse,
+                                Some(&name),
+                                &input,
+                            );
+                            // 诊断（hook 坏了）进通知条，不拦对话。
+                            for d in diags {
+                                self.deps.sink.emit(AgentEvent::Error {
+                                    at: ErrorWhere::Tool,
+                                    message: format!("hook 诊断：{d}"),
+                                    fatal: false,
+                                });
+                            }
+                            if hooked.deny {
+                                let reason = hooked
+                                    .reason
+                                    .unwrap_or_else(|| "hook 拒绝了这次调用".to_string());
+                                // 呈现与 plan 拦截同一条：ToolResult(is_error) + history，
+                                // 模型读到理由后可以换条路，R57 配对不破。
+                                let started = Instant::now();
+                                let (preview, _) = ToolOutput::text(reason.clone()).event_view();
+                                self.deps.sink.emit(AgentEvent::ToolResult {
+                                    call_id: id.clone(),
+                                    is_error: true,
+                                    ms: started.elapsed().as_millis() as u64,
+                                    preview,
+                                    images: vec![],
+                                });
+                                self.history.push(Message::tool(
+                                    &id,
+                                    ToolOutput::text(reason),
+                                    true,
+                                ));
+                                continue;
+                            }
+                            // PreToolUse 的附加上下文：并进本次工具结果尾部（模型下一次
+                            // 请求就能看到），不改变工具本身的输入。
+                            if let Some(extra) = hooked.additional_context {
+                                hook_context = Some(extra);
+                            }
+                        }
                         // 取消臂住在 gate 内部（R43）：弹窗挂着的时候按停止，`select!` 打不断
                         // 一个已经在 await 的 `check`，只能由它自己收场。
                         let decision = self.deps.gate.check(&view, &ctx.cancel).await;
@@ -661,6 +757,50 @@ impl AgentSession {
                         }
                     }
                 };
+                // G44 PostToolUse：工具真的跑完了（成功或失败都跑）—— 用户脚本在这里
+                // 做审计/补上下文。同样**不拦**：结果已经发生，hook 只能追加信息；
+                // 它给的 additional_context 附在本次工具结果尾部（与 PreToolUse 同一条
+                // 出口），deny 语义在 PostToolUse 上**忽略**（没有可拦的东西）。
+                let mut output = output;
+                let mut hook_notes: Vec<String> = Vec::new();
+                if let Some(extra) = hook_context.take() {
+                    hook_notes.push(extra);
+                }
+                if let Some(dir) = &self.cfg.hooks_dir {
+                    // 工具入参的**回显**（工具已经拿走了所有权）：hooks 要的是"这次调用
+                    // 长什么样"，不是原始 JSON 引用。PostToolUse 的脚本通常在审计。
+                    let echo = serde_json::json!({ "name": name });
+                    let input = crate::hooks::HookInput {
+                        event: "PostToolUse",
+                        session_id: "",
+                        cwd: crate::hooks::cwd_string(),
+                        tool: Some(crate::hooks::ToolPayload {
+                            name: &name,
+                            input: &echo,
+                        }),
+                    };
+                    let (hooked, diags) = crate::hooks::run_event(
+                        dir,
+                        crate::hooks::HookEvent::PostToolUse,
+                        Some(&name),
+                        &input,
+                    );
+                    for d in diags {
+                        self.deps.sink.emit(AgentEvent::Error {
+                            at: ErrorWhere::Tool,
+                            message: format!("hook 诊断：{d}"),
+                            fatal: false,
+                        });
+                    }
+                    if let Some(extra) = hooked.additional_context {
+                        hook_notes.push(extra);
+                    }
+                }
+                if !hook_notes.is_empty() {
+                    // 拼接而非替换：工具输出是模型回答的事实基础，hook 只追加。
+                    let note = hook_notes.join("\n");
+                    output = ToolOutput::text(format!("{}\n\n[hook] {note}", output.full_text()));
+                }
                 let (preview, images) = output.event_view();
                 // Cache images off the async worker; the event itself must keep its order,
                 // so only the disk part is moved to a blocking thread.
@@ -834,6 +974,30 @@ impl AgentSession {
     /// 每个出口都只经这里：`Done` 恰好一条，且带的就是返回值本身。
     /// `defer_done` 模式下不发 —— 调用方在落库成功后用同一个 `r` 补发。
     fn finish(&self, r: StopReason) -> StopReason {
+        // G44 Stop：一轮结束时跑（fire-and-forget 语义由 hook 自己的超时兜住，
+        // 这里同步等 —— 用户脚本里"发通知/写审计"通常很快，等它才有确定性）。
+        // 用 `stop_hook_fired` 防重：`finish` 在多条出口路径上都可能被走到。
+        if let Some(dir) = &self.cfg.hooks_dir
+            && !self
+                .stop_hook_fired
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let input = crate::hooks::HookInput {
+                event: "Stop",
+                session_id: "",
+                cwd: crate::hooks::cwd_string(),
+                tool: None,
+            };
+            let (_, diags) =
+                crate::hooks::run_event(dir, crate::hooks::HookEvent::Stop, None, &input);
+            for d in diags {
+                self.deps.sink.emit(AgentEvent::Error {
+                    at: ErrorWhere::Tool,
+                    message: format!("hook 诊断：{d}"),
+                    fatal: false,
+                });
+            }
+        }
         if !self.defer_done {
             self.deps.sink.emit(AgentEvent::Done { stop_reason: r });
         }
@@ -1004,6 +1168,11 @@ impl AgentSession {
         if let Some(section) = self.agents_md_section() {
             tail.push_str("\n\n");
             tail.push_str(&section);
+        }
+        // G44：SessionStart hook 给的本轮备注（用户的"会话开场"信息）。
+        if !self.startup_notes.is_empty() {
+            tail.push_str("\n\n## 会话备注（hooks）\n");
+            tail.push_str(&self.startup_notes.join("\n"));
         }
         // 追加段交给 ContextBuilder 一起算预算：先 build 再往外贴会让请求凭空超线。
         let built = self.deps.context.build_with_extra(&self.history, &tail);

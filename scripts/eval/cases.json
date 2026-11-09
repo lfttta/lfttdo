@@ -1,0 +1,17 @@
+{
+  "//": "G45 会话级回归评测的案例集。判定契约见 run.mjs 头注释。",
+  "cases": [
+    {
+      "name": "boot-clean-profile",
+      "prompt": "（无提示词，只验冷启动）",
+      "why": "全新数据目录能起来、不崩、不写用户真实目录 —— 每轮评测的第一道闸",
+      "settle_ms": 5000
+    },
+    {
+      "name": "boot-second-launch",
+      "prompt": "（同一 profile 再起一次）",
+      "why": "第二次启动要能复用已有库与会话（第一次的隔离不能变成一次性）",
+      "settle_ms": 4000
+    }
+  ]
+}

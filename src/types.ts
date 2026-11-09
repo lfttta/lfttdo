@@ -113,6 +113,26 @@ export interface SkillView {
   enabled: boolean;
 }
 
+/** G44：hooks 面板的一行（ipc.rs::HookView）。`digest` 是信任键（绑定声明内容）。 */
+export interface HookView {
+  event: string;
+  matcher: string;
+  command: string;
+  args: string[];
+  timeout_ms: number;
+  digest: string;
+  trusted: boolean;
+}
+
+/** `hooks_list` 的返回（ipc.rs::HooksView）。 */
+export interface HooksView {
+  config_path: string;
+  enabled: boolean;
+  /** hooks.json 存在且能解析。false 时面板要提示「文件有问题，当前不生效」。 */
+  config_ok: boolean;
+  hooks: HookView[];
+}
+
 /** `skills_list` 的返回（ipc.rs::SkillsView）：root 是磁盘上的技能目录，面板原样显示。 */
 export interface SkillsView {
   root: string;

@@ -256,6 +256,8 @@ function renderInputOf(input: unknown): RenderInput | null {
  * iframe（`event.source`），别的窗口/iframe 冒充无效。超长截断到 2000 字符。
  */
 const FOLLOWUP_MAX_CHARS = 2_000;
+/** G40+：widgetState 的 modelContent 上限（与 ZCode 的 16 KiB 同量级，这里按字符）。 */
+const WIDGET_STATE_MAX_CHARS = 16_000;
 
 function RenderedHtmlCard({
   html,
@@ -270,26 +272,71 @@ function RenderedHtmlCard({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
+  /**
+   * G40+：widgetState 双分区（照 ZCode 的取向）。
+   * · `modelContent`：页面希望**模型知道**的状态（用户选了哪个方案、翻到了哪一页）。
+   *   它随 `lfttdo:followup` 一起进对话（人审确认条上可见），是"有意义的回流"。
+   * · `privateContent`：仅用于页面自己恢复界面的状态（滚动位置、折叠展开）。
+   *   **永远不进上下文** —— 这类状态对模型无意义，进了只是烧 token 与噪声。
+   * 两者都只在组件内存里（组件重挂即丢，跨重启不存 —— 与 ZCode 的
+   * 「widgetState 不是持久存储」同一取向；要真持久得进库，另需一轮设计）。
+   */
+  const [pageState, setPageState] = useState<{
+    modelContent: string | null;
+    privateContent: unknown;
+  }>({ modelContent: null, privateContent: null });
   const frameRef = useRef<HTMLIFrameElement | null>(null);
-  const src = `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+  // 页面状态回灌：把已保存的 state 塞进 HTML 头部，页面脚本在首帧就能读它
+  // （`window.__lfttdo_state`）来恢复界面。data URL 是全新文档，没有别的通道。
+  const hydrated =
+    pageState.privateContent === null && pageState.modelContent === null
+      ? html
+      : html.replace(
+          /<head([^>]*)>/i,
+          (_m, attrs) =>
+            `<head${attrs}><script>window.__lfttdo_state=${JSON.stringify({
+              modelContent: pageState.modelContent,
+              privateContent: pageState.privateContent,
+            }).replace(/</g, "\\u003c")};</script>`,
+        );
+  const src = `data:text/html;charset=utf-8,${encodeURIComponent(
+    hydrated.includes("<head") ? hydrated : `<head></head>${hydrated}`,
+  )}`;
   useEffect(() => {
     const onMessage = (e: MessageEvent) => {
       if (e.source !== frameRef.current?.contentWindow) return;
-      const data = e.data as { type?: unknown; prompt?: unknown } | null;
+      const data = e.data as {
+        type?: unknown;
+        prompt?: unknown;
+        modelContent?: unknown;
+        privateContent?: unknown;
+      } | null;
+      if (data === null || typeof data !== "object") return;
+      // G40+：页面主动保存状态（`{type:"lfttdo:state", modelContent, privateContent}`）。
+      // 只收字符串/JSON 可序列化的形状；超长按 16 KiB 截断（与 ZCode 同量级）。
+      if (data.type === "lfttdo:state") {
+        const model =
+          typeof data.modelContent === "string" && data.modelContent.trim() !== ""
+            ? data.modelContent.trim().slice(0, WIDGET_STATE_MAX_CHARS)
+            : null;
+        setPageState({ modelContent: model, privateContent: data.privateContent ?? null });
+        return;
+      }
       if (
-        data === null ||
-        typeof data !== "object" ||
         data.type !== "lfttdo:followup" ||
         typeof data.prompt !== "string" ||
         data.prompt.trim() === ""
       ) {
         return;
       }
-      setPendingPrompt(data.prompt.trim().slice(0, FOLLOWUP_MAX_CHARS));
+      // 回流带上 modelContent（若有）：确认条上用户能看到"页面想说什么 + 带着什么状态"。
+      const extra =
+        pageState.modelContent === null ? "" : `\n\n[页面状态] ${pageState.modelContent}`;
+      setPendingPrompt((data.prompt.trim() + extra).slice(0, FOLLOWUP_MAX_CHARS));
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, []);
+  }, [pageState.modelContent]);
   return (
     <div className="rendered-html" data-testid="rendered-html">
       {title === null ? null : <div className="rendered-title">{title}</div>}

@@ -20,6 +20,7 @@ import type {
   Settings,
   SettingsView,
   ShellProfile,
+  HooksView,
   SkillsView,
 } from "../types";
 
@@ -108,6 +109,19 @@ export const retryLastSession = (id: string) =>
  */
 export const searchSessionFiles = (sessionId: string, query: string) =>
   invoke<string[]>("session_search_files", { sessionId, query });
+
+/**
+ * G44：hooks 面板的数据（声明列表 + 每条信任状态）。`digest` 是信任/撤销的键，
+ * 绑定**当前声明内容** —— hooks.json 一改，旧 digest 自然失效（回到未信任）。
+ */
+export const hooksList = () => invoke<HooksView>("hooks_list");
+/** 信任 / 撤销一条 hook。撤销后它立刻停止执行（下一轮生效）。 */
+export const hooksSetTrusted = (
+  digest: string,
+  trusted: boolean,
+): Promise<void> => invoke("hooks_set_trusted", { digest, trusted });
+/** 打开数据目录（去改 hooks.json）。 */
+export const hooksOpenFolder = (): Promise<void> => invoke("hooks_open_folder");
 
 /**
  * `settings_get` 返回**拍平一层**的 `SettingsView`（`ipc.rs:488-500` 的 `#[serde(flatten)]`），

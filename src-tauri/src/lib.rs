@@ -9,6 +9,8 @@
 
 pub mod agent;
 pub mod external_link;
+/// G44：用户 hook（事件脚本 + digest 信任）。与 Tauri 无关，纯逻辑可单测。
+pub mod hooks;
 pub mod image_cache;
 pub mod image_prep;
 pub mod ipc;

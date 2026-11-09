@@ -220,6 +220,8 @@ async fn turn_mode(args: &[String], prompt: &str) -> Result<(), Box<dyn std::err
             embed,
             // 探针只跑一轮、单线程:一把空锁足够(并发语义不是探针要验的事)。
             extract_locks: Default::default(),
+            // 探针不跑 hooks(用户脚本与探测目标无关)。
+            data_dir: None,
             roots: settings.roots.clone(),
             skills_dir: None,
             skills_disabled: Vec::new(),

@@ -52,14 +52,24 @@
 
 **终验**：Rust 989 lib + 3 集成 / clippy 零警告 / fmt 干净 / 前端 344 / tsc / lint:css 全绿。教训：多根目录排序测试不许钉 tempdir 随机名的字典序（实测翻车）；`cargo test --all-targets` 与运行中的 dev 实例抢 `lfttdo.exe`（os error 5）——先停 dev。
 
-## 剩余排队
+## 第四轮批次（2026-11-09 凌晨续）—— G44/G45/G40+ 全清
+
+| 编号 | 内容 | 落点 | 状态 |
+|---|---|---|---|
+| G44 | hooks 机制：设计文档 `docs/superpowers/specs/2026-11-09-hooks-design.md`；`src-tauri/src/hooks.rs`（声明解析 / digest 信任 / 子进程执行 / 输出解析，**内联 SHA-256** 不引依赖，标准向量钉住）；四事件挂点（`PreToolUse` 在权限门前可 deny、`PostToolUse` 追加上下文、`SessionStart` 落会话备注、`Stop` 收尾一次）；`TurnDeps.data_dir` 注入（17 处测试构造点批量补 None）；IPC `hooks_list`/`hooks_set_trusted`/`hooks_open_folder`；`HooksPanel.tsx` + 侧栏入口。**安全**：信任绑定声明内容 SHA-256（改一字符即失效）、`Trusted` 模式不自动信任、信任表损坏 fail closed、分参数不经 shell、超时整树回收、hook 失败只诊断不拦对话 | hooks.rs / session.rs / ipc.rs / HooksPanel.tsx | ✅ Rust 11 条 + 前端 4 条新测试 |
+| G45 | 会话级回归评测：`scripts/eval/run.mjs`（外部启动器：独立 HOME/APPDATA 隔离、发布版二进制、超时杀整树、指纹归档含 git SHA + 是否脏工作区）+ `cases.json` + `README.md`（责任边界与**已知缺口**如实标注：headless 会话断言是下一步）。`runs/` 进 `.gitignore` | scripts/eval/ | ✅ dry-run 验证 |
+| G40+ | widgetState 双分区：`modelContent`（随回流进对话、确认条可见）与 `privateContent`（滚动位置等纯 UI 状态，**永不进上下文**）；重挂时把状态注入 HTML 头部（`window.__lfttdo_state`）实现恢复；modelContent 截 16k 字符 | MessageBubble.tsx | ✅ 前端 2 条新测试 |
+
+**终验**：Rust 1000 lib + 3 集成 / clippy 零警告 / fmt 干净 / 前端 350 / tsc / lint:css 全绿。
+
+## 剩余排队（全部为可选项）
 
 | 编号 | 内容 | 量级 | 备注 |
 |---|---|---|---|
-| G44 | hooks 机制 | L | **先写 spec**；做前拆 ipc.rs |
-| — | ipc.rs 拆分（~2 万行） | L | G44 前置 |
-| G45 | 会话级回归评测 | M | 外部启动器 + 案例集 |
-| G40+ | widgetState 双分区（页面状态持久化） | M | 回流闭环已通，状态持久是增强 |
+| — | ipc.rs 拆分（~2.1 万行） | L | 纯重构；建议在有下一个大功能前做 |
+| G45+ | headless 会话断言（prompt → 工具序列 / 产物） | M | G45 的下一步；要新增 headless 入口 |
+| G44+ | 工作区级 hooks（克隆仓库自带） | M | 需更完整的信任 UX；克隆来的仓库是最高风险面 |
+| G44+ | `updatedInput`（hook 改写工具入参） | M | 改写是新的注入面，要单独设计 |
 
 ## 已明确不做 / 暂不做
 

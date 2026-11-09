@@ -8,6 +8,8 @@ interface SidebarProps {
   onOpenSettings?: () => void;
   onOpenMcp?: () => void;
   onOpenSkills?: () => void;
+  /** G44：hooks 面板入口。 */
+  onOpenHooks?: () => void;
   rows: SessionRow[];
   activeId: string | null;
   onSelect: (id: string) => void;
@@ -34,6 +36,7 @@ export function Sidebar({
   onOpenSettings,
   onOpenMcp,
   onOpenSkills,
+  onOpenHooks,
   rows,
   activeId,
   onSelect,
@@ -209,6 +212,14 @@ export function Sidebar({
           onClick={onOpenMcp}
         >
           MCP
+        </button>
+        <button
+          type="button"
+          className="sidebar-action"
+          aria-label="Hooks"
+          onClick={onOpenHooks}
+        >
+          Hooks
         </button>
       </div>
     </nav>

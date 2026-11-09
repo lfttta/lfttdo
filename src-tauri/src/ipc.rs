@@ -456,6 +456,9 @@ pub struct TurnDeps {
     /// 拿不到说明另一个路径正在抽同一会话 —— 那段内容归它处理,本轮跳过抽取、
     /// 压缩照常(游标由它推进,内容不丢)。
     pub extract_locks: ExtractLocks,
+    /// G44：hooks 配置与信任表所在的数据目录。`None` = 不跑 hooks（测试缺省）。
+    /// 与 roots/skills_dir 同一条线：每轮由 `send_message` 从 `AppState` 现取。
+    pub data_dir: Option<PathBuf>,
     /// T26（R276）：`read_file` 能读的那张目录表，**每轮从 `Settings` 现取**（`send_message`
     /// 头里那一次 `store.load()` 是它唯一的来源，不缓存 —— 用户改了设置，下一轮就该生效）。
     ///
@@ -1369,6 +1372,7 @@ pub async fn run_turn(
         skills_disabled,
         cancel,
         extract_locks,
+        data_dir,
     } = deps;
     if let Some(dir) = &output_dir
         && !roots.contains(dir)
@@ -1550,6 +1554,8 @@ pub async fn run_turn(
         allowed_tools,
         active_agent_name,
         agents,
+        // G44：hooks 的配置与信任表在数据目录；会话侧每轮现读（改完不用重启）。
+        hooks_dir: data_dir,
         ..Default::default()
     });
     session.defer_done();
@@ -1904,6 +1910,8 @@ pub async fn send_message(
             // task 的行为与从前一致。
             agents: agent_profiles(&settings),
             extract_locks: state.extracting.clone(),
+            // G44：hooks 的配置与信任表在数据目录（会话侧每轮现读）。
+            data_dir: Some(state.data_dir.clone()),
             // T26（R276）：roots 和上面两项同源 —— 同一个 `store.load()` 的每一轮现取，
             // 因此**用户改完设置发下一条消息就生效**，这里没有任何缓存可以过期。
             // R284：交的是设置文件里那份**原表**（不再是在读盘时被裁过的），裁剪在
@@ -2500,6 +2508,107 @@ pub async fn session_workspace_set(
             .map_err(|e| e.to_string())
     })
     .await
+}
+
+// ───────────────────────── G44：hooks 的设置面 ─────────────────────────
+
+/// 面板一行：一条声明 + 它的信任状态。`digest` 是信任/撤销的键，前端原样回传。
+#[derive(Debug, Serialize)]
+pub struct HookView {
+    pub event: String,
+    pub matcher: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub timeout_ms: u64,
+    pub digest: String,
+    pub trusted: bool,
+}
+
+#[derive(Serialize)]
+pub struct HooksView {
+    /// hooks.json 的路径（面板显示「改这个文件」）。
+    pub config_path: String,
+    pub enabled: bool,
+    /// hooks.json 存在且解析成功。`false` 时面板要提示「文件有问题，当前不生效」。
+    pub config_ok: bool,
+    pub hooks: Vec<HookView>,
+}
+
+pub(crate) fn hooks_view_of(data_dir: &Path) -> HooksView {
+    let path = data_dir.join(crate::hooks::HOOKS_FILE);
+    let config_ok = !path.exists()
+        || std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .is_some();
+    let cfg = crate::hooks::load_config(data_dir);
+    let trust = crate::hooks::TrustStore::load(data_dir);
+    let mut hooks = Vec::new();
+    for (name, decls) in &cfg.events {
+        // 事件名按配置里的原样展示（用户写的）；判定用解析后的枚举。
+        let event = match name.trim().to_ascii_lowercase().as_str() {
+            "sessionstart" => crate::hooks::HookEvent::SessionStart,
+            "pretooluse" => crate::hooks::HookEvent::PreToolUse,
+            "posttooluse" => crate::hooks::HookEvent::PostToolUse,
+            "stop" => crate::hooks::HookEvent::Stop,
+            _ => continue, // 未知事件名：面板不展示（也不执行 —— decls() 同样查不到）
+        };
+        for d in decls {
+            let digest = d.digest(event);
+            hooks.push(HookView {
+                event: event.as_str().to_string(),
+                matcher: d.matcher.clone(),
+                command: d.command.clone(),
+                args: d.args.clone(),
+                timeout_ms: d.timeout_ms.unwrap_or(crate::hooks::DEFAULT_TIMEOUT_MS),
+                trusted: trust.is_trusted(&digest),
+                digest,
+            });
+        }
+    }
+    HooksView {
+        config_path: path.display().to_string(),
+        enabled: cfg.enabled,
+        config_ok,
+        hooks,
+    }
+}
+
+#[tauri::command]
+pub async fn hooks_list(state: State<'_, AppState>) -> Result<HooksView, String> {
+    let dir = state.data_dir.clone();
+    blocking(move || Ok(hooks_view_of(&dir))).await
+}
+
+/// 信任/撤销一条 hook。`trusted: true` = 记进信任表，`false` = 撤销。
+/// digest 由前端从 `hooks_list` 原样拿回来 —— 它绑定的是**当前**声明内容；
+/// 用户改了 hooks.json 之后旧 digest 自然不再匹配新声明（回到未信任）。
+#[tauri::command]
+pub async fn hooks_set_trusted(
+    state: State<'_, AppState>,
+    digest: String,
+    trusted: bool,
+) -> Result<(), String> {
+    let dir = state.data_dir.clone();
+    blocking(move || {
+        let mut store = crate::hooks::TrustStore::load(&dir);
+        if trusted {
+            store.grant(&digest);
+        } else {
+            store.revoke(&digest);
+        }
+        store.save(&dir)
+    })
+    .await
+}
+
+/// 在资源管理器里打开数据目录（用户去改 hooks.json）。
+/// 目标固定为**应用自己的数据目录**，不是用户给来的路径 —— 不需要走
+/// `reveal_path` 那套 roots 校验（那条闸是防「模型让界面打开任意路径」的）。
+#[tauri::command]
+pub async fn hooks_open_folder(state: State<'_, AppState>) -> Result<(), String> {
+    let dir = state.data_dir.clone();
+    blocking(move || crate::path_reveal::reveal(&dir)).await
 }
 
 /// G43：@文件提及的浮层数据。搜索范围 = 全局 roots + 当前会话的输出目录
@@ -3725,6 +3834,9 @@ pub fn run() {
             session_export,
             session_retry_last,
             session_search_files,
+            hooks_list,
+            hooks_set_trusted,
+            hooks_open_folder,
             session_output_view,
             session_workspace_set,
             memories_list,
@@ -4227,6 +4339,7 @@ mod tests {
                     // 带假嵌入的测试由 T6 那组自己定制。
                     embed: None,
                     extract_locks: crate::ipc::ExtractLocks::default(),
+                    data_dir: None,
                     cancel: self.cancel.clone(),
                 },
                 sid,
@@ -4614,6 +4727,7 @@ mod tests {
                 memory: MemoryTurnCfg::default(),
                 embed: None,
                 extract_locks: crate::ipc::ExtractLocks::default(),
+                data_dir: None,
                 cancel: f.cancel.clone(),
             },
             &sid,
@@ -4694,6 +4808,7 @@ mod tests {
                 memory: MemoryTurnCfg::default(),
                 embed: None,
                 extract_locks: crate::ipc::ExtractLocks::default(),
+                data_dir: None,
                 cancel: f.cancel.clone(),
             },
             &sid,
@@ -5471,6 +5586,7 @@ mod tests {
                 memory: MemoryTurnCfg::default(),
                 embed: None,
                 extract_locks: crate::ipc::ExtractLocks::default(),
+                data_dir: None,
                 skills_dir: None,
                 skills_disabled: Vec::new(),
                 cancel: f.cancel.clone(),
@@ -5542,6 +5658,7 @@ mod tests {
                 memory: MemoryTurnCfg::default(),
                 embed: None,
                 extract_locks: crate::ipc::ExtractLocks::default(),
+                data_dir: None,
                 skills_dir: None,
                 skills_disabled: Vec::new(),
                 cancel: f.cancel.clone(),
@@ -5929,6 +6046,7 @@ mod tests {
                 memory: MemoryTurnCfg::default(),
                 embed: None,
                 extract_locks: crate::ipc::ExtractLocks::default(),
+                data_dir: None,
                 cancel: f.cancel.clone(),
             },
             &sid,
@@ -6530,6 +6648,7 @@ mod tests {
                 memory: MemoryTurnCfg::default(),
                 embed: None,
                 extract_locks: crate::ipc::ExtractLocks::default(),
+                data_dir: None,
                 skills_dir: None,
                 skills_disabled: Vec::new(),
                 cancel: f.cancel.clone(),
@@ -6712,6 +6831,7 @@ mod tests {
                 memory: MemoryTurnCfg::default(),
                 embed: None,
                 extract_locks: crate::ipc::ExtractLocks::default(),
+                data_dir: None,
                 skills_dir: None,
                 skills_disabled: Vec::new(),
                 cancel: f.cancel.clone(),
@@ -6780,6 +6900,7 @@ mod tests {
                 memory: MemoryTurnCfg::default(),
                 embed: None,
                 extract_locks: crate::ipc::ExtractLocks::default(),
+                data_dir: None,
                 skills_dir: None,
                 skills_disabled: Vec::new(),
                 cancel: f.cancel.clone(),
@@ -6931,6 +7052,7 @@ mod tests {
                 memory: MemoryTurnCfg::default(),
                 embed: None,
                 extract_locks: crate::ipc::ExtractLocks::default(),
+                data_dir: None,
                 skills_dir: None,
                 skills_disabled: Vec::new(),
                 cancel: f.cancel.clone(),
@@ -7105,6 +7227,7 @@ mod tests {
                 memory: MemoryTurnCfg::default(),
                 embed: None,
                 extract_locks: crate::ipc::ExtractLocks::default(),
+                data_dir: None,
                 skills_dir: None,
                 skills_disabled: Vec::new(),
                 cancel: f.cancel.clone(),
@@ -7253,6 +7376,7 @@ mod tests {
                 },
                 embed: None,
                 extract_locks: crate::ipc::ExtractLocks::default(),
+                data_dir: None,
                 skills_dir: None,
                 skills_disabled: Vec::new(),
                 cancel: f.cancel.clone(),
@@ -7311,6 +7435,7 @@ mod tests {
                 memory,
                 embed,
                 extract_locks: ExtractLocks::default(),
+                data_dir: None,
                 skills_dir: None,
                 skills_disabled: Vec::new(),
                 cancel: f.cancel.clone(),
@@ -7682,6 +7807,7 @@ mod tests {
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 extract_locks: ExtractLocks::default(),
+                data_dir: None,
                 // 假嵌入器只对**本轮查询**生效(「北京住在哪」含「北京」→ [1,0]);
                 // 行向量走库里已写好的 BLOB —— 读路径的向量来源与写路径解耦,
                 // 这正是要端到端验证的线。
@@ -8177,6 +8303,7 @@ mod tests {
                 memory,
                 embed: None,
                 extract_locks: crate::ipc::ExtractLocks::default(),
+                data_dir: None,
                 skills_dir: None,
                 skills_disabled: Vec::new(),
                 cancel: f.cancel.clone(),
@@ -9164,6 +9291,7 @@ mod tests {
                     memory: MemoryTurnCfg::default(),
                     embed: None,
                     extract_locks: ExtractLocks::default(),
+                    data_dir: None,
                     cancel: f.cancel.clone(),
                 },
                 &sid,

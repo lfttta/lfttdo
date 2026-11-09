@@ -16,3 +16,6 @@ release/
 .worktrees/
 
 src-tauri/.cargo/
+
+# G45 eval evidence (timestamped run dirs, not committed)
+scripts/eval/runs/

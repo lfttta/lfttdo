@@ -4,6 +4,7 @@ import { MessageList, COLLAPSED_MAX, groupRuns } from "./components/MessageList"
 import { SettingsPanel } from "./components/SettingsPanel";
 import { McpPanel } from "./components/McpPanel";
 import { SkillsPanel } from "./components/SkillsPanel";
+import { HooksPanel } from "./components/HooksPanel";
 import { Sidebar } from "./components/Sidebar";
 import * as api from "./ipc/commands";
 import { useTextBuffer } from "./ipc/batching";
@@ -149,6 +150,8 @@ export default function App() {
   const [settingsView, setSettingsView] = useState<SettingsView | null>(null);
   const [mcpOpen, setMcpOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
+  /** G44：hooks 面板（与技能面板互斥打开，同一时刻只盖一层）。 */
+  const [hooksOpen, setHooksOpen] = useState(false);
   const [composerSeed, setComposerSeed] = useState<{
     id: number;
     text: string;
@@ -768,7 +771,14 @@ export default function App() {
         onToggleCollapsed={() => setSidebarOpen((v) => !v)}
         onOpenSettings={openSettings}
         onOpenMcp={() => setMcpOpen(true)}
-        onOpenSkills={() => setSkillsOpen(true)}
+        onOpenSkills={() => {
+          setHooksOpen(false);
+          setSkillsOpen(true);
+        }}
+        onOpenHooks={() => {
+          setSkillsOpen(false);
+          setHooksOpen(true);
+        }}
         rows={rows}
         activeId={activeId}
         onSelect={(id) => {
@@ -934,6 +944,9 @@ export default function App() {
         />
       ) : null}
       {mcpOpen ? <McpPanel onClose={() => setMcpOpen(false)} /> : null}
+      {hooksOpen ? (
+        <HooksPanel onClose={() => setHooksOpen(false)} />
+      ) : null}
       {skillsOpen ? (
         <SkillsPanel
           onClose={() => setSkillsOpen(false)}

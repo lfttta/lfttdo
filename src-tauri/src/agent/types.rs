@@ -137,6 +137,20 @@ impl ToolOutput {
             }
         }
     }
+
+    /// G44：**不截断**的文本形态（hooks 追加内容时用 —— 拿 preview 会在 200 字符处
+    /// 把工具输出砍掉再拼上 hook 的话，模型就看不到真实结果了）。图片降级为占位。
+    pub fn full_text(&self) -> String {
+        match self {
+            ToolOutput::Text { text } => text.clone(),
+            ToolOutput::Image { mime, .. } => format!("[图片 {}]", mime_word(mime)),
+            ToolOutput::Multi { parts } => parts
+                .iter()
+                .map(ToolOutput::full_text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
 }
 
 fn mime_word(mime: &ImageMime) -> &'static str {
