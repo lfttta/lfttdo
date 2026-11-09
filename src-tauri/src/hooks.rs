@@ -30,6 +30,101 @@ pub const MAX_TIMEOUT_MS: u64 = 60_000;
 /// `additional_context` 与 `reason` 的输出上限（字符）。
 pub const MAX_CONTEXT_CHARS: usize = 8_000;
 pub const MAX_REASON_CHARS: usize = 2_000;
+/// 工作区级 hooks 住哪：`<workspace>/.lfttdo/hooks.json`（与 todos/undo 同一个应用态目录）。
+pub const WORKSPACE_STATE_DIR: &str = ".lfttdo";
+
+/// hook 声明的来源作用域。
+///
+/// 两个作用域**不共享信任**：工作区级的 hooks.json 可能是克隆仓库自带的，
+/// 它是一份**不可信文件** —— 用户为某个仓库里同名同内容的 hook 授予的信任，
+/// 不该自动延伸到另一个仓库。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookScope {
+    /// 数据目录（用户自己写的）。
+    User,
+    /// 会话工作区里的 `.lfttdo/`（可能是克隆来的）。
+    Workspace,
+}
+
+impl HookScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HookScope::User => "user",
+            HookScope::Workspace => "workspace",
+        }
+    }
+}
+
+/// 一个 hook 来源：配置目录 + 它在信任表里的键前缀。
+///
+/// 信任表始终只有**一份**（数据目录里的 `hooks-trust.json`），作用域靠键前缀区分：
+/// 用户作用域的前缀是空串（键 = digest 本身，与 v0.2.0 的旧信任表兼容），
+/// 工作区作用域是 `ws:<工作区路径摘要>:`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookSource {
+    /// hooks.json 所在目录。
+    pub config_dir: std::path::PathBuf,
+    pub scope: HookScope,
+    /// 信任键前缀（见上）。
+    pub trust_prefix: String,
+}
+
+/// 工作区路径的信任前缀。**按路径绑定**：同一个 hook 在仓库 A 被信任，
+/// 不会让仓库 B 里的同内容声明也变成已信任 —— 换了目录就是换了来源。
+pub fn workspace_trust_prefix(root: &Path) -> String {
+    // canonicalize 失败（目录已消失）时用原样的路径文本：宁可换一个前缀让信任失效，
+    // 也不要退化成「所有解析不出的路径共用一个前缀」。
+    let key = root
+        .canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| root.display().to_string());
+    let digest = sha256_hex(key.as_bytes());
+    format!("ws:{}:", &digest[..16])
+}
+
+/// 一轮要跑的 hook 全集：信任表位置 + 有序来源表。
+///
+/// 顺序有意义：先用户作用域、后工作区作用域 —— 折叠规则是「`updated_input` 后者
+/// 覆盖前者」，所以工作区规则能修正（但不能取消）用户的改写；`deny` 谁都能下。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookRuntime {
+    /// 信任表所在目录（永远是应用的数据目录）。
+    pub trust_dir: std::path::PathBuf,
+    pub sources: Vec<HookSource>,
+}
+
+impl HookRuntime {
+    /// 只跑用户作用域（没有工作区的会话）。
+    pub fn user_only(data_dir: &Path) -> Self {
+        Self {
+            trust_dir: data_dir.to_path_buf(),
+            sources: vec![HookSource {
+                config_dir: data_dir.to_path_buf(),
+                scope: HookScope::User,
+                trust_prefix: String::new(),
+            }],
+        }
+    }
+
+    /// 追加工作区作用域（`<workspace>/.lfttdo`）。
+    ///
+    /// **只登记来源，不等于启用**：工作区来源还必须过信任表里的
+    /// `workspace_enabled` 全局开关（默认关）。开关与逐条 digest 信任是两把锁：
+    /// 克隆一个仓库不该让它的 hook 因为「文件里写着 enabled」就武装起来。
+    pub fn with_workspace(mut self, workspace: &Path) -> Self {
+        let dir = workspace.join(WORKSPACE_STATE_DIR);
+        self.sources.push(HookSource {
+            config_dir: dir,
+            scope: HookScope::Workspace,
+            trust_prefix: workspace_trust_prefix(workspace),
+        });
+        self
+    }
+
+    pub fn has_workspace(&self) -> bool {
+        self.sources.iter().any(|s| s.scope == HookScope::Workspace)
+    }
+}
 
 /// 四个事件。线上名字是 CamelCase（与 ZCode 同一套叫法，用户可迁移）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +240,11 @@ pub fn load_config(data_dir: &Path) -> HookConfig {
 pub struct TrustStore {
     #[serde(default)]
     pub trusted: Vec<String>,
+    /// 工作区级 hooks 的总开关。**默认关**：克隆来的仓库自带 hooks 是本机制里
+    /// 最高风险的输入面，必须由用户在面板里显式打开才可能生效；打开后仍然要求
+    /// 逐条 digest 信任（两把锁，缺一不可）。
+    #[serde(default)]
+    pub workspace_enabled: bool,
 }
 
 impl TrustStore {
@@ -198,6 +298,15 @@ pub struct HookOutput {
     pub deny: bool,
     pub reason: Option<String>,
     pub additional_context: Option<String>,
+    /// G44+ `updated_input`：hook 改写的工具入参（只对 `PreToolUse` 有意义）。
+    ///
+    /// **改写之后权限门看的是改写后的入参**（`session.rs` 重建 `ToolCallView`）：
+    /// 若门还按原入参判定，一条 hook 就能把「批准过的 `ls`」换成任意命令执行。
+    /// 这是本字段唯一不可让步的语义。
+    ///
+    /// 只收 JSON **对象**（工具入参的形状）；数组/字符串等一律按协议错误处理
+    /// （诊断，不拦）—— 「改写入参」的形状错了却照跑，比不改更危险。
+    pub updated_input: Option<Value>,
 }
 
 /// 执行结果。
@@ -319,57 +428,88 @@ pub fn parse_output(stdout: &str) -> Result<HookOutput, String> {
         Some(Value::String(_)) => None,
         Some(_) => return Err("additional_context 必须是字符串".into()),
     };
+    // G44+ updatedInput：只接受对象（工具入参的形状）。`null` = 明确不改写。
+    let updated_input = match obj.get("updated_input") {
+        None | Some(Value::Null) => None,
+        Some(v) if v.is_object() => Some(v.clone()),
+        Some(_) => return Err("updated_input 必须是 JSON 对象".into()),
+    };
     Ok(HookOutput {
         deny,
         reason,
         additional_context,
+        updated_input,
     })
 }
 
 /// 跑某个事件下**所有**已信任且 matcher 命中的 hook，折叠成一次结果。
 ///
-/// 折叠规则：任一 deny ⇒ 整体 deny（理由拼接）；上下文按声明顺序拼接；
-/// 诊断文本累积（用户要能看到哪些 hook 坏了）。未信任的 hook 不进结果 ——
-/// 信任状态由调用方在面板里展示，这里不重复提示。
+/// 折叠规则：
+/// * 任一 deny ⇒ 整体 deny（理由按声明顺序拼接）—— deny 是终局，别的 hook 改写
+///   入参也不会让这次调用跑起来；
+/// * 上下文按声明顺序拼接；
+/// * `updated_input` **后来者覆盖前者**（来源顺序 + 声明顺序里最后一条说了算）。
+///   折叠成一份而不是逐条应用：多条 hook 各自基于「原始入参」改写时，串行叠加的
+///   语义是「谁先谁赢一半」，用户无从预期；取最后一条至少是确定且可解释的。
+/// * 诊断文本累积（用户要能看到哪些 hook 坏了）。
+///
+/// 未信任的 hook 不进结果 —— 信任状态由调用方在面板里展示，这里不重复提示。
+///
+/// **工作区来源的两把锁**（见 [`HookRuntime`]）：`workspace_enabled` 未打开时，
+/// 工作区来源整段跳过（连声明都不读）；打开后仍逐条按 `trust_prefix + digest` 查表。
 pub fn run_event(
-    data_dir: &Path,
+    runtime: &HookRuntime,
     event: HookEvent,
     tool: Option<&str>,
     input: &HookInput,
 ) -> (HookOutput, Vec<String>) {
-    let cfg = load_config(data_dir);
-    if !cfg.enabled {
-        return (HookOutput::default(), Vec::new());
-    }
-    let trust = TrustStore::load(data_dir);
+    // 一次性读信任表：多个来源共享同一份，中途改文件不该让同一次调用看到两套信任。
+    let trust = TrustStore::load(&runtime.trust_dir);
     let mut acc = HookOutput::default();
     let mut diags = Vec::new();
     let mut contexts: Vec<String> = Vec::new();
-    for decl in cfg.decls(event) {
-        if let Some(tool) = tool
-            && !decl.matches_tool(event, tool)
-        {
+    for source in &runtime.sources {
+        if source.scope == HookScope::Workspace && !trust.workspace_enabled {
+            continue; // 总开关关闭：工作区来源完全不可见
+        }
+        let cfg = load_config(&source.config_dir);
+        if !cfg.enabled {
             continue;
         }
-        if !trust.is_trusted(&decl.digest(event)) {
-            continue; // 未信任：不执行（信任与否由面板展示）
-        }
-        match run_hook(&decl, event, input) {
-            HookOutcome::Done(o) => {
-                if o.deny {
-                    acc.deny = true;
-                    if let Some(r) = o.reason {
-                        acc.reason = Some(match acc.reason.take() {
-                            Some(prev) => format!("{prev}；{r}"),
-                            None => r,
-                        });
+        for decl in cfg.decls(event) {
+            if let Some(tool) = tool
+                && !decl.matches_tool(event, tool)
+            {
+                continue;
+            }
+            let key = format!("{}{}", source.trust_prefix, decl.digest(event));
+            if !trust.is_trusted(&key) {
+                continue; // 未信任：不执行（信任与否由面板展示）
+            }
+            match run_hook(&decl, event, input) {
+                HookOutcome::Done(o) => {
+                    if o.deny {
+                        acc.deny = true;
+                        if let Some(r) = o.reason {
+                            acc.reason = Some(match acc.reason.take() {
+                                Some(prev) => format!("{prev}；{r}"),
+                                None => r,
+                            });
+                        }
+                    }
+                    if let Some(c) = o.additional_context {
+                        contexts.push(c);
+                    }
+                    // 只有 PreToolUse 的改写有意义（别的时机工具已经跑完/还没被调用）。
+                    // deny 的调用根本不会执行，改写值留着也无害（调用方在 deny 分支直接返回）。
+                    if event == HookEvent::PreToolUse
+                        && let Some(v) = o.updated_input
+                    {
+                        acc.updated_input = Some(v);
                     }
                 }
-                if let Some(c) = o.additional_context {
-                    contexts.push(c);
-                }
+                HookOutcome::Diagnosed(d) => diags.push(d),
             }
-            HookOutcome::Diagnosed(d) => diags.push(d),
         }
     }
     if !contexts.is_empty() {
@@ -606,6 +746,33 @@ mod tests {
         assert!(parse_output(r#"{"reason":42}"#).is_err());
     }
 
+    // G44+ updatedInput：只收对象；`null` = 不改写；非对象是协议错误（不是静默忽略）。
+    // 「形状错了却照跑」在改写入参这件事上比不改更危险 —— 用户以为限制生效了。
+    #[test]
+    fn updated_input_takes_objects_and_rejects_other_json_shapes() {
+        let o = parse_output(r#"{"updated_input":{"command":"ls -la"}}"#).unwrap();
+        assert_eq!(
+            o.updated_input,
+            Some(serde_json::json!({"command": "ls -la"}))
+        );
+        assert_eq!(
+            parse_output(r#"{"updated_input":null}"#)
+                .unwrap()
+                .updated_input,
+            None
+        );
+        assert!(parse_output(r#"{"updated_input":"ls"}"#).is_err());
+        assert!(parse_output(r#"{"updated_input":[1,2]}"#).is_err());
+        assert!(parse_output(r#"{"updated_input":42}"#).is_err());
+        // 空对象是合法改写（把入参清空到工具自己报缺参），不是「没有改写」。
+        assert_eq!(
+            parse_output(r#"{"updated_input":{}}"#)
+                .unwrap()
+                .updated_input,
+            Some(serde_json::json!({}))
+        );
+    }
+
     // 端到端（无网络、无外部依赖）：真跑一个平台命令当 hook。
     /// 写一份 .cmd 脚本把给定 JSON 打到 stdout —— 比 `cmd /C echo {...}` 可靠：
     /// echo 对 `"` 的处理随 shell 版本变，转义写不对时测试红的是夹具不是被测代码。
@@ -695,7 +862,12 @@ mod tests {
                 input: &serde_json::json!({}),
             }),
         };
-        let (out, diags) = run_event(d.path(), HookEvent::PreToolUse, Some("run_command"), &input);
+        let (out, diags) = run_event(
+            &HookRuntime::user_only(d.path()),
+            HookEvent::PreToolUse,
+            Some("run_command"),
+            &input,
+        );
         assert!(!out.deny, "未信任的 hook 不许拦");
         assert!(diags.is_empty());
     }
@@ -728,7 +900,12 @@ mod tests {
                 input: &serde_json::json!({}),
             }),
         };
-        let (out, _) = run_event(d.path(), HookEvent::PreToolUse, Some("run_command"), &input);
+        let (out, _) = run_event(
+            &HookRuntime::user_only(d.path()),
+            HookEvent::PreToolUse,
+            Some("run_command"),
+            &input,
+        );
         assert!(out.deny, "已信任的 deny 必须生效");
     }
 
@@ -747,8 +924,291 @@ mod tests {
             cwd: cwd_string(),
             tool: None,
         };
-        let (out, diags) = run_event(d.path(), HookEvent::PreToolUse, None, &input);
+        let (out, diags) = run_event(
+            &HookRuntime::user_only(d.path()),
+            HookEvent::PreToolUse,
+            None,
+            &input,
+        );
         assert_eq!(out, HookOutput::default());
         assert!(diags.is_empty());
+    }
+
+    /// 把一条声明写进配置并授予信任（`run_event` 的两道闸都过）。
+    /// `event` 同时决定「写进哪个事件」与「按哪个事件算 digest」—— 两者混用会让
+    /// digest 对不上（信任表里的键与运行时查的键不是同一个）。
+    #[cfg(windows)]
+    fn trusted_decl(dir: &Path, event: HookEvent, script: HookDecl) {
+        let cfg = serde_json::json!({
+            "enabled": true,
+            "events": { event.as_str(): [{
+                "matcher": "*", "command": script.command, "args": script.args
+            }]}
+        });
+        std::fs::write(dir.join(HOOKS_FILE), cfg.to_string()).unwrap();
+        let loaded = load_config(dir);
+        let decl = loaded.decls(event)[0].clone();
+        let mut trust = TrustStore::default();
+        trust.grant(&decl.digest(event));
+        trust.save(dir).unwrap();
+    }
+
+    // G44+ updatedInput 折叠：**声明顺序里最后一条说了算**（不是合并、不是第一条赢）。
+    // 多条 hook 各自基于「原始入参」改写时，串行叠加的语义是「谁先谁赢一半」，
+    // 用户无从预期；取最后一条至少是确定且可解释的。
+    #[cfg(windows)]
+    #[test]
+    fn updated_input_is_last_writer_wins() {
+        let d = tmp();
+        let first = script_cmd(d.path(), r#"{"updated_input":{"n":1}}"#);
+        let mut second = first.clone();
+        // 同一个 .cmd 文件，但声明不同（args 不同 ⇒ digest 不同 ⇒ 是两条独立 hook）。
+        // 用第二个脚本文件承载不同的输出。
+        let second_path = d.path().join("hook2.cmd");
+        std::fs::write(
+            &second_path,
+            "@echo off\r\necho {\"updated_input\":{\"n\":2}}\r\n",
+        )
+        .unwrap();
+        second.args = vec!["/C".into(), second_path.display().to_string()];
+
+        let cfg = serde_json::json!({
+            "enabled": true,
+            "events": { "PreToolUse": [
+                { "matcher": "*", "command": first.command, "args": first.args },
+                { "matcher": "*", "command": second.command, "args": second.args }
+            ]}
+        });
+        std::fs::write(d.path().join(HOOKS_FILE), cfg.to_string()).unwrap();
+        let loaded = load_config(d.path());
+        let decls = loaded.decls(HookEvent::PreToolUse);
+        assert_eq!(decls.len(), 2);
+        let mut trust = TrustStore::default();
+        for dl in &decls {
+            trust.grant(&dl.digest(HookEvent::PreToolUse));
+        }
+        trust.save(d.path()).unwrap();
+
+        let input = HookInput {
+            event: "PreToolUse",
+            session_id: "s",
+            cwd: cwd_string(),
+            tool: Some(ToolPayload {
+                name: "echo",
+                input: &serde_json::json!({"text": "原始"}),
+            }),
+        };
+        let (out, diags) = run_event(
+            &HookRuntime::user_only(d.path()),
+            HookEvent::PreToolUse,
+            Some("echo"),
+            &input,
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(
+            out.updated_input,
+            Some(serde_json::json!({"n": 2})),
+            "应当取声明顺序里最后一条的改写"
+        );
+    }
+
+    // G44+：改写只对 PreToolUse 有意义 —— 别的时机工具已经跑完（PostToolUse）或还没
+    // 被调用（SessionStart/Stop），收下改写值会让调用方以为发生了什么，其实什么也没发生。
+    #[cfg(windows)]
+    #[test]
+    fn updated_input_is_ignored_outside_pre_tool_use() {
+        let d = tmp();
+        let script = script_cmd(d.path(), r#"{"updated_input":{"n":1}}"#);
+        trusted_decl(d.path(), HookEvent::PostToolUse, script);
+        let input = HookInput {
+            event: "PostToolUse",
+            session_id: "s",
+            cwd: cwd_string(),
+            tool: Some(ToolPayload {
+                name: "run_command",
+                input: &serde_json::json!({}),
+            }),
+        };
+        let (out, _) = run_event(
+            &HookRuntime::user_only(d.path()),
+            HookEvent::PostToolUse,
+            Some("run_command"),
+            &input,
+        );
+        assert_eq!(out.updated_input, None, "PostToolUse 的改写必须被丢弃");
+    }
+
+    // ───────────────────── G44+ 工作区级 hooks：两把锁 ─────────────────────
+
+    /// 在工作区里写一份 hooks.json + 一条会 deny 的脚本。
+    #[cfg(windows)]
+    fn workspace_fixture(workspace: &Path) -> HookDecl {
+        let state_dir = workspace.join(WORKSPACE_STATE_DIR);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let script = script_cmd(&state_dir, r#"{"decision":"deny","reason":"ws-rule"}"#);
+        let cfg = serde_json::json!({
+            "enabled": true,
+            "events": { "PreToolUse": [{
+                "matcher": "run_command", "command": script.command, "args": script.args
+            }]}
+        });
+        std::fs::write(state_dir.join(HOOKS_FILE), cfg.to_string()).unwrap();
+        script
+    }
+
+    /// 第一把锁：`workspace_enabled` 默认关 —— 工作区配置里写着 `"enabled": true`
+    /// 也**绝不能**跑。克隆一个仓库就等于把它的脚本执行权交给了仓库作者，
+    /// 这是本机制里最高风险的输入面。
+    #[cfg(windows)]
+    #[test]
+    fn a_workspace_hook_never_runs_until_the_master_switch_is_on() {
+        let data = tmp();
+        let ws = tmp();
+        workspace_fixture(ws.path());
+        let input = HookInput {
+            event: "PreToolUse",
+            session_id: "s",
+            cwd: cwd_string(),
+            tool: Some(ToolPayload {
+                name: "run_command",
+                input: &serde_json::json!({}),
+            }),
+        };
+        let rt = HookRuntime::user_only(data.path()).with_workspace(ws.path());
+        // 即便把每条 digest 都信任了，总开关不开就一条都不跑 —— 两把锁缺一不可。
+        let cfg = load_config(&ws.path().join(WORKSPACE_STATE_DIR));
+        let decl = cfg.decls(HookEvent::PreToolUse)[0].clone();
+        let mut trust = TrustStore::default();
+        let prefix = workspace_trust_prefix(ws.path());
+        trust.grant(&format!("{prefix}{}", decl.digest(HookEvent::PreToolUse)));
+        trust.save(data.path()).unwrap();
+
+        let (out, diags) = run_event(&rt, HookEvent::PreToolUse, Some("run_command"), &input);
+        assert!(!out.deny, "总开关关着时工作区 hook 绝不许跑");
+        assert!(diags.is_empty());
+    }
+
+    /// 第二把锁：总开关打开之后，仍然要逐条 digest 信任。仓库作者改一行脚本，
+    /// 信任就失效（与用户作用域同一条规则）。
+    #[cfg(windows)]
+    #[test]
+    fn a_workspace_hook_still_needs_per_declaration_trust() {
+        let data = tmp();
+        let ws = tmp();
+        workspace_fixture(ws.path());
+        let input = HookInput {
+            event: "PreToolUse",
+            session_id: "s",
+            cwd: cwd_string(),
+            tool: Some(ToolPayload {
+                name: "run_command",
+                input: &serde_json::json!({}),
+            }),
+        };
+        let rt = HookRuntime::user_only(data.path()).with_workspace(ws.path());
+
+        // 只打开总开关，不信任任何声明。
+        let trust = TrustStore {
+            workspace_enabled: true,
+            ..Default::default()
+        };
+        trust.save(data.path()).unwrap();
+        let (out, _) = run_event(&rt, HookEvent::PreToolUse, Some("run_command"), &input);
+        assert!(!out.deny, "总开关开了但没逐条信任 ⇒ 不跑");
+
+        // 信任之后才生效 —— 且信任键带工作区前缀。
+        let cfg = load_config(&ws.path().join(WORKSPACE_STATE_DIR));
+        let decl = cfg.decls(HookEvent::PreToolUse)[0].clone();
+        let prefix = workspace_trust_prefix(ws.path());
+        let mut trust = TrustStore::load(data.path());
+        trust.grant(&format!("{prefix}{}", decl.digest(HookEvent::PreToolUse)));
+        trust.save(data.path()).unwrap();
+        let (out, diags) = run_event(&rt, HookEvent::PreToolUse, Some("run_command"), &input);
+        assert!(out.deny, "两把锁都开了才生效：{diags:?}");
+        assert_eq!(out.reason.as_deref(), Some("ws-rule"));
+    }
+
+    /// 信任按**路径**绑定：仓库 A 里信任过的同内容声明，不会让仓库 B 里那份也变已信任。
+    /// 这是「克隆来的代码不可信」原则在信任键上的落点。
+    #[cfg(windows)]
+    #[test]
+    fn workspace_trust_does_not_leak_across_directories() {
+        let data = tmp();
+        let a = tmp();
+        let b = tmp();
+        workspace_fixture(a.path());
+        workspace_fixture(b.path());
+        assert_ne!(
+            workspace_trust_prefix(a.path()),
+            workspace_trust_prefix(b.path()),
+            "不同路径必须给出不同的信任前缀"
+        );
+
+        // 在 A 里信任（总开关也打开）。
+        let cfg = load_config(&a.path().join(WORKSPACE_STATE_DIR));
+        let decl = cfg.decls(HookEvent::PreToolUse)[0].clone();
+        let trust = TrustStore {
+            trusted: vec![format!(
+                "{}{}",
+                workspace_trust_prefix(a.path()),
+                decl.digest(HookEvent::PreToolUse)
+            )],
+            workspace_enabled: true,
+        };
+        trust.save(data.path()).unwrap();
+
+        let input = HookInput {
+            event: "PreToolUse",
+            session_id: "s",
+            cwd: cwd_string(),
+            tool: Some(ToolPayload {
+                name: "run_command",
+                input: &serde_json::json!({}),
+            }),
+        };
+        // A 跑得起来。
+        let rt_a = HookRuntime::user_only(data.path()).with_workspace(a.path());
+        assert!(
+            run_event(&rt_a, HookEvent::PreToolUse, Some("run_command"), &input)
+                .0
+                .deny,
+            "A 里已信任"
+        );
+        // B 里同内容的声明**不**已信任：换个目录就是换个来源。
+        let rt_b = HookRuntime::user_only(data.path()).with_workspace(b.path());
+        assert!(
+            !run_event(&rt_b, HookEvent::PreToolUse, Some("run_command"), &input)
+                .0
+                .deny,
+            "B 里的同内容声明不该继承 A 的信任"
+        );
+    }
+
+    /// 用户作用域的信任键**不带前缀**（与 v0.2.0 的旧信任表兼容：老用户的信任不失效）。
+    #[test]
+    fn the_user_scope_trust_key_is_the_bare_digest() {
+        let rt = HookRuntime::user_only(std::path::Path::new("C:/data"));
+        assert_eq!(rt.sources.len(), 1);
+        assert_eq!(rt.sources[0].scope, HookScope::User);
+        assert_eq!(
+            rt.sources[0].trust_prefix, "",
+            "旧信任表里的裸 digest 必须继续有效"
+        );
+        assert!(!rt.has_workspace());
+        assert!(
+            rt.with_workspace(std::path::Path::new("D:/repo"))
+                .has_workspace()
+        );
+    }
+
+    /// 旧版信任表（只有 `trusted` 数组、没有 `workspace_enabled`）必须照常读出来，
+    /// 且新字段落到默认值 false —— 升级不该把用户已有的信任清零，也不该顺手打开工作区。
+    #[test]
+    fn an_old_trust_file_still_loads_with_the_workspace_switch_off() {
+        let d = tmp();
+        std::fs::write(d.path().join(TRUST_FILE), r#"{"trusted":["abc","def"]}"#).unwrap();
+        let store = TrustStore::load(d.path());
+        assert_eq!(store.trusted, vec!["abc".to_string(), "def".to_string()]);
+        assert!(!store.workspace_enabled, "缺字段时工作区总开关必须是关的");
     }
 }

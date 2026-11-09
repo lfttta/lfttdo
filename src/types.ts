@@ -113,7 +113,11 @@ export interface SkillView {
   enabled: boolean;
 }
 
-/** G44：hooks 面板的一行（ipc.rs::HookView）。`digest` 是信任键（绑定声明内容）。 */
+/**
+ * G44/G44+：hooks 面板的一行（ipc.rs::HookView）。
+ * `digest` 是**信任键**（已带作用域前缀：工作区来源是 `ws:<路径摘要>:<digest>`），
+ * 前端原样递回 `hooks_set_trusted` 即可，不要自己拼前缀。
+ */
 export interface HookView {
   event: string;
   matcher: string;
@@ -122,6 +126,8 @@ export interface HookView {
   timeout_ms: number;
   digest: string;
   trusted: boolean;
+  /** `"user"`（数据目录）或 `"workspace"`（会话工作文件夹里的 `.lfttdo/`）。 */
+  scope: string;
 }
 
 /** `hooks_list` 的返回（ipc.rs::HooksView）。 */
@@ -130,6 +136,13 @@ export interface HooksView {
   enabled: boolean;
   /** hooks.json 存在且能解析。false 时面板要提示「文件有问题，当前不生效」。 */
   config_ok: boolean;
+  /**
+   * G44+：工作区级 hooks 的总开关（默认 false）。关着时 `hooks` 里不会出现
+   * 工作区条目 —— 面板要解释「打开后仍然要逐条信任」。
+   */
+  workspace_enabled: boolean;
+  /** 当前会话的工作文件夹（null = 这个会话没有，谈不上工作区级 hooks）。 */
+  workspace: string | null;
   hooks: HookView[];
 }
 

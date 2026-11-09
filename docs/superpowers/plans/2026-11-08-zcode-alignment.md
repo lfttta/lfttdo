@@ -62,14 +62,25 @@
 
 **终验**：Rust 1000 lib + 3 集成 / clippy 零警告 / fmt 干净 / 前端 350 / tsc / lint:css 全绿。
 
+## 第五轮批次（2026-11-09 上午）—— 剩余排队四项全清
+
+| 编号 | 内容 | 落点 | 状态 |
+|---|---|---|---|
+| G44+ | **`updatedInput`**：`HookOutput.updated_input`（只收 JSON 对象，`null` = 不改写，非对象是协议错误）；`run_event` 折叠规则「声明顺序里最后一条说了算」；`session.rs` 用改写后的入参**重建 `ToolCallView`** 再进权限门 —— 若门按原入参判定，一条 hook 就能把批准过的 `ls` 换成任意命令执行。改写同时进通知条（不静默） | hooks.rs / session.rs | ✅ Rust 4 条新测试（含「改写后的 rm 被 deny 规则拦住」的门侧半边） |
+| G44+ | **工作区级 hooks（两把锁）**：`.lfttdo/hooks.json` 随会话工作文件夹走；`HookRuntime`（信任表位置 + 有序来源表）；`HookScope` + `workspace_trust_prefix` 让**信任按路径绑定**（仓库 A 信任的同内容声明不会让仓库 B 也变已信任）；`TrustStore.workspace_enabled` 默认关（克隆仓库自带 hooks 是最高风险输入面）；用户作用域信任键**不带前缀**（v0.2.0 旧信任表继续有效）。IPC 加 `hooks_set_workspace_enabled`，`hooks_list`/`hooks_open_folder` 带 `session_id`；面板分「用户作用域 / 工作区级」两段，总开关是**独立动作 + window.confirm** | hooks.rs / session.rs / ipc.rs / HooksPanel.tsx | ✅ Rust 5 条 + 前端 4 条新测试 |
+| G45+ | **headless 会话入口**：新模块 `headless.rs`（不 `use tauri`）；`lfttdo --headless --prompt ...`；stdout **纯 NDJSON**（与前端同一份线上格式）、诊断走 stderr；退出码 0/1/2/3；数据目录默认 `%APPDATA%\com.qwa.do\headless`（与 GUI 同父不同叶，不污染真实会话）；权限门**不装 sink** ⇒ Write/Exec 走 deny（比 GUI 更严）；装配复用 `build_production_registry`/`agent_profiles`（不另起简化版）。设计文档 `docs/superpowers/specs/2026-11-09-headless-eval-design.md` | headless.rs / main.rs / lib.rs | ✅ Rust 9 条新测试 + 端到端实跑（`turn_start`→`error`→`done`，纯 NDJSON） |
+| G45+ | **eval 两层判定**：启动层（GUI 起得来，`boot_only`）+ 会话层（`--headless` 真跑，断言 `expect.tools`/`any_of_tools`/`stop_reason`/`files`/`text_contains`/`no_errors`）；`--boot-only` 跳过会话层；**端点不可达时会话层明确失败 exit 1，不静默跳过**；NDJSON 与 stderr 原始证据落盘；`binary` 字段标明 release/debug | scripts/eval/ | ✅ dry-run + 端点缺失路径实测 |
+| — | **ipc.rs 拆分**：10512 行 → **3985 行**（生产代码）+ `ipc/tests.rs` 6518 行。子模块对父模块私有项天然可见，`use super::*` 零改动；`#[cfg(test)] mod tests;` 保证不进 release | src-tauri/src/ipc.rs + ipc/tests.rs | ✅ 拆分后 1016 + 3 全绿，测试名保持 `ipc::tests::*` |
+
+**终验**：Rust **1016 lib + 3 集成** / clippy 零警告 / fmt 干净 / 前端 **354** / tsc / lint:css 全绿。
+
 ## 剩余排队（全部为可选项）
 
 | 编号 | 内容 | 量级 | 备注 |
 |---|---|---|---|
-| — | ipc.rs 拆分（~2.1 万行） | L | 纯重构；建议在有下一个大功能前做 |
-| G45+ | headless 会话断言（prompt → 工具序列 / 产物） | M | G45 的下一步；要新增 headless 入口 |
-| G44+ | 工作区级 hooks（克隆仓库自带） | M | 需更完整的信任 UX；克隆来的仓库是最高风险面 |
-| G44+ | `updatedInput`（hook 改写工具入参） | M | 改写是新的注入面，要单独设计 |
+| G45++ | 会话层用例的**精确序列**断言（现在多为 `any_of_tools` 宽松档） | S | 需要挑「只有一种合理做法」的提示词 |
+| G44++ | hook 的 `async: true`（fire-and-forget 档） | S | 同步语义是能拦截的前提；异步只对 `Stop` 有意义 |
+| — | 更细的模块拆法（把 hooks/mcp/skills 的 IPC 命令各拆一个子模块） | M | 现在 3985 行已可读；再拆的收益低于它的 diff 噪音 |
 
 ## 已明确不做 / 暂不做
 

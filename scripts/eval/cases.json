@@ -1,17 +1,68 @@
 {
-  "//": "G45 会话级回归评测的案例集。判定契约见 run.mjs 头注释。",
+  "//": "G45/G45+ 会话级回归评测的案例集。判定契约见 run.mjs 头注释。",
+  "//layers": "boot_only=true 的用例只验启动层；带 prompt 的走 --headless 会话层（需要真实端点）。",
+  "//seed": "seed 目录会被复制进该用例的隔离 profile，也是 headless 的工作目录。",
+  "endpoint": {
+    "//": "评测默认打本机 Ollama。换端点改这里，或用 --boot-only 跳过会话层。",
+    "base_url": "http://127.0.0.1:11434/v1",
+    "model": null
+  },
   "cases": [
     {
       "name": "boot-clean-profile",
-      "prompt": "（无提示词，只验冷启动）",
+      "boot_only": true,
       "why": "全新数据目录能起来、不崩、不写用户真实目录 —— 每轮评测的第一道闸",
       "settle_ms": 5000
     },
     {
       "name": "boot-second-launch",
-      "prompt": "（同一 profile 再起一次）",
+      "boot_only": true,
       "why": "第二次启动要能复用已有库与会话（第一次的隔离不能变成一次性）",
       "settle_ms": 4000
+    },
+    {
+      "name": "plain-reply",
+      "prompt": "Reply with exactly one word: pong",
+      "why": "最朴素的路径：不调工具、正常收尾。这条挂了说明模型/端点接线断了，别的用例的失败都不可信",
+      "expect": {
+        "stop_reason": "end_turn",
+        "tools": [],
+        "no_errors": true
+      },
+      "timeout_secs": 120
+    },
+    {
+      "name": "read-a-file",
+      "prompt": "Use read_file to read notes.txt in the working directory, then tell me its second line only.",
+      "why": "Read 档工具在 headless 下自动放行、能真的读到文件、结果回到模型 —— 「工具闭环」的最小证据",
+      "seed": "seeds/notes",
+      "expect": {
+        "stop_reason": "end_turn",
+        "any_of_tools": ["read_file"],
+        "text_contains": "second line placeholder"
+      },
+      "timeout_secs": 180
+    },
+    {
+      "name": "write-a-file",
+      "prompt": "Use write_file to create hello.txt in the working directory with the content 'hello'.",
+      "why": "Write 档在 headless 下没有可应答的界面，必须被拒（gate 的既有语义）。这条验的是 deny 路径而不是写入成功 —— headless 不模拟点『允许』",
+      "expect": {
+        "stop_reason": "end_turn",
+        "any_of_tools": ["write_file"]
+      },
+      "timeout_secs": 180
+    },
+    {
+      "name": "glob-lists-files",
+      "prompt": "Use glob to list every .txt file in the working directory, then report the file names.",
+      "why": "glob 是纯本地只读工具、结果确定，适合钉「工具真的跑起来了」而不掺模型判断",
+      "seed": "seeds/notes",
+      "expect": {
+        "stop_reason": "end_turn",
+        "any_of_tools": ["glob", "grep"]
+      },
+      "timeout_secs": 180
     }
   ]
 }

@@ -1047,6 +1047,13 @@ button.path-chip:disabled {
   font-size: 1.1em;
 }
 
+/* 面板内部的分组小标题（G44+：hooks 的用户作用域 / 工作区级两段）。 */
+.panel-subtitle {
+  margin: 4px 0 0;
+  font-size: 0.95em;
+  opacity: 0.8;
+}
+
 .panel-group {
   display: flex;
   flex-direction: column;

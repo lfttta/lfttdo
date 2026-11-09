@@ -103,10 +103,10 @@ pub struct SessionConfig {
     /// 主会话这一轮，子代理是谁、能干什么，是派活那一刻才定的事。Default 空表 =
     /// 无档案可点名，task 的行为与从前逐字节一致。
     pub agents: Vec<AgentProfile>,
-    /// G44：hooks 配置与信任表所在目录（数据目录）。`None` = 不跑 hooks。
-    /// 放 `SessionConfig` 而不是 `SessionDeps` 字段：本结构全仓都用
-    /// `..Default::default()` 构造（见 `ipc.rs` 装配点），加字段零破坏面。
-    pub hooks_dir: Option<std::path::PathBuf>,
+    /// G44/G44+：本轮要跑的 hook 全集（用户作用域 + 可选的工作区作用域）。
+    /// `None` = 不跑 hooks。放 `SessionConfig` 而不是 `SessionDeps` 字段：本结构全仓
+    /// 都用 `..Default::default()` 构造（见 `ipc.rs` 装配点），加字段零破坏面。
+    pub hooks: Option<crate::hooks::HookRuntime>,
 }
 
 impl Default for SessionConfig {
@@ -118,7 +118,7 @@ impl Default for SessionConfig {
             allowed_tools: None,
             active_agent_name: None,
             agents: Vec::new(),
-            hooks_dir: None,
+            hooks: None,
         }
     }
 }
@@ -419,7 +419,7 @@ impl AgentSession {
         // G44 SessionStart：每轮开始前跑（用户的"会话开始"语义 = 一轮对话的开始，
         // 与 ZCode 的 SessionStart 同义）。它的 additional_context 落成本轮的第一条
         // 系统备注 —— 模型在第一次请求里就能读到。
-        if let Some(dir) = &self.cfg.hooks_dir {
+        if let Some(hooks) = &self.cfg.hooks {
             let input = crate::hooks::HookInput {
                 event: "SessionStart",
                 session_id: "",
@@ -427,7 +427,7 @@ impl AgentSession {
                 tool: None,
             };
             let (hooked, diags) =
-                crate::hooks::run_event(dir, crate::hooks::HookEvent::SessionStart, None, &input);
+                crate::hooks::run_event(hooks, crate::hooks::HookEvent::SessionStart, None, &input);
             for d in diags {
                 self.deps.sink.emit(AgentEvent::Error {
                     at: ErrorWhere::Tool,
@@ -649,13 +649,22 @@ impl AgentSession {
                 let started = Instant::now();
                 // G44：PreToolUse 的附加上下文（本工具的 hook 给的），并进结果尾部。
                 let mut hook_context: Option<String> = None;
+                // G44+：PreToolUse 改写后的入参。**权限门必须看改写后的那一份** ——
+                // 否则「用户批准了一次 `ls`」可以被 hook 换成任意命令执行，权限门
+                // 就成了摆设。改写也不静默：本次工具结果尾部会带一行说明，模型与
+                // 用户都能看到「实际执行的入参与你要的不一样」。
+                let mut hook_rewrote: Option<serde_json::Value> = None;
+                // G44+：真正交给工具的入参。`input` 在 `execute` 处被 move 走，而
+                // PostToolUse 的审计回显要的是「实际执行的那一份」（可能是改写后的）——
+                // 在这里先占一个槽，`None` 档路径上会被填上。
+                let mut executed_input = serde_json::Value::Null;
                 let (output, is_error) = match already {
                     Some(note) => (ToolOutput::text(note), false),
                     None => {
                         // G44 PreToolUse：在权限门**之前**跑（用户 hook 可以先拦下，
                         // 省掉一次无意义的弹窗）。deny 的呈现走与权限门同一条路：
                         // 结果作为 is_error 回给模型，理由就是 hook 给的那句话。
-                        if let Some(dir) = &self.cfg.hooks_dir {
+                        if let Some(hooks) = &self.cfg.hooks {
                             // session_id 归外层（`AgentSession` 不持会话 id：它是
                             // 一轮编排者，落库/会话归属全在 ipc 侧）。hook 拿空串 ——
                             // 需要归属的脚本应改用 cwd 或自己的环境变量。
@@ -669,7 +678,7 @@ impl AgentSession {
                                 }),
                             };
                             let (hooked, diags) = crate::hooks::run_event(
-                                dir,
+                                hooks,
                                 crate::hooks::HookEvent::PreToolUse,
                                 Some(&name),
                                 &input,
@@ -709,7 +718,43 @@ impl AgentSession {
                             if let Some(extra) = hooked.additional_context {
                                 hook_context = Some(extra);
                             }
+                            // G44+：改写入参（`run_event` 已按声明顺序取最后一条）。
+                            // 形状由 `parse_output` 保证是对象。
+                            if let Some(new_input) = hooked.updated_input {
+                                hook_rewrote = Some(new_input);
+                            }
                         }
+                        // G44+：有改写就用改写后的入参**重建** view 再进权限门。
+                        // `rule_key` / `scope_of` / Exec 的命令分段全部从 `view.input`
+                        // 算出来 —— 拿旧 view 判新入参，等于给 hook 一张绕过权限门的
+                        // 通行证（这是本功能唯一不可让步的语义）。
+                        let view = match &hook_rewrote {
+                            Some(new_input) => {
+                                let flat = serde_json::to_string(new_input)
+                                    .unwrap_or_else(|_| "?".to_string());
+                                let note = format!("hook 把 {name} 的入参改写为 {flat}");
+                                // 界面上要能看见：入参不是模型原本要的那一份。
+                                self.deps.sink.emit(AgentEvent::Error {
+                                    at: ErrorWhere::Tool,
+                                    message: note.clone(),
+                                    fatal: false,
+                                });
+                                hook_context = Some(match hook_context.take() {
+                                    Some(prev) => format!("{prev}\n{note}"),
+                                    None => note,
+                                });
+                                ToolCallView {
+                                    input: new_input.clone(),
+                                    ..view
+                                }
+                            }
+                            None => view,
+                        };
+                        let input = hook_rewrote.unwrap_or(input);
+                        // G44+：PostToolUse 的回显要用**真正执行的**那份入参（`input`
+                        // 下面会被 `execute` 拿走所有权，这里先留一份）。hook 改写过的
+                        // 情况下，审计脚本拿到的必须是改写后的值，不是模型原本说的。
+                        executed_input = input.clone();
                         // 取消臂住在 gate 内部（R43）：弹窗挂着的时候按停止，`select!` 打不断
                         // 一个已经在 await 的 `check`，只能由它自己收场。
                         let decision = self.deps.gate.check(&view, &ctx.cancel).await;
@@ -766,10 +811,17 @@ impl AgentSession {
                 if let Some(extra) = hook_context.take() {
                     hook_notes.push(extra);
                 }
-                if let Some(dir) = &self.cfg.hooks_dir {
-                    // 工具入参的**回显**（工具已经拿走了所有权）：hooks 要的是"这次调用
-                    // 长什么样"，不是原始 JSON 引用。PostToolUse 的脚本通常在审计。
-                    let echo = serde_json::json!({ "name": name });
+                if let Some(hooks) = &self.cfg.hooks {
+                    // 工具入参的**回显**：hooks 要的是"这次调用长什么样"。用的是
+                    // `executed_input`（真正交给工具的那一份，可能被 PreToolUse 改写），
+                    // 不是模型最初说的那一份 —— 审计脚本看到的必须是实际执行的东西。
+                    // 未执行路径（技能正文已加载、被门拒绝）没有入参可回显，给一个
+                    // 只带名字的对象，保持字段形状稳定。
+                    let echo = if executed_input.is_null() {
+                        serde_json::json!({ "name": name })
+                    } else {
+                        executed_input.clone()
+                    };
                     let input = crate::hooks::HookInput {
                         event: "PostToolUse",
                         session_id: "",
@@ -780,7 +832,7 @@ impl AgentSession {
                         }),
                     };
                     let (hooked, diags) = crate::hooks::run_event(
-                        dir,
+                        hooks,
                         crate::hooks::HookEvent::PostToolUse,
                         Some(&name),
                         &input,
@@ -977,7 +1029,7 @@ impl AgentSession {
         // G44 Stop：一轮结束时跑（fire-and-forget 语义由 hook 自己的超时兜住，
         // 这里同步等 —— 用户脚本里"发通知/写审计"通常很快，等它才有确定性）。
         // 用 `stop_hook_fired` 防重：`finish` 在多条出口路径上都可能被走到。
-        if let Some(dir) = &self.cfg.hooks_dir
+        if let Some(hooks) = &self.cfg.hooks
             && !self
                 .stop_hook_fired
                 .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -989,7 +1041,7 @@ impl AgentSession {
                 tool: None,
             };
             let (_, diags) =
-                crate::hooks::run_event(dir, crate::hooks::HookEvent::Stop, None, &input);
+                crate::hooks::run_event(hooks, crate::hooks::HookEvent::Stop, None, &input);
             for d in diags {
                 self.deps.sink.emit(AgentEvent::Error {
                     at: ErrorWhere::Tool,
@@ -2680,6 +2732,252 @@ mod tests {
             rig.sink.permission_ids()
         );
         assert_every_request_paired(&rig);
+    }
+
+    // ───────────────────────── G44+：PreToolUse 改写入参 ─────────────────────────
+
+    /// 一个只读的「命令」替身：记下自己收到的入参，Read 档（零弹窗）。
+    /// hooks 的改写要在 Read 档工具上测 —— 那样弹窗不会掺进来，断言只看「工具实际
+    /// 收到了什么」。
+    struct RecordingTool(Arc<Mutex<Vec<serde_json::Value>>>);
+
+    #[async_trait]
+    impl Tool for RecordingTool {
+        fn meta(&self) -> ToolMeta {
+            ToolMeta {
+                name: "runner".into(),
+                description: "记下收到的入参".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } }
+                }),
+                risk: Risk::Read,
+            }
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            self.0.lock().unwrap().push(input.clone());
+            Ok(ToolOutput::text("跑完了"))
+        }
+    }
+
+    /// 同上但 **Exec 档**：走权限门的 `RuleOutcome` 路径（Exec 才有命令分段判定）。
+    /// 「改写后的命令要被 deny 规则拦住」这条只能在 Exec 档上测 —— Write 档的匹配串
+    /// 是 `path`，跑不出 `rm *` 这条规则。
+    struct ExecRecordingTool(Arc<Mutex<Vec<serde_json::Value>>>);
+
+    #[async_trait]
+    impl Tool for ExecRecordingTool {
+        fn meta(&self) -> ToolMeta {
+            ToolMeta {
+                name: "exec_runner".into(),
+                description: "记下收到的入参（Exec 档）".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } }
+                }),
+                risk: Risk::Exec,
+            }
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            self.0.lock().unwrap().push(input.clone());
+            Ok(ToolOutput::text("执行了"))
+        }
+    }
+
+    #[cfg(windows)]
+    fn hook_script(dir: &std::path::Path, json: &str) -> crate::hooks::HookDecl {
+        let path = dir.join("poke.cmd");
+        // **只用 ASCII**：`echo` 走控制台代码页（中文系统是 GBK），写 UTF-8 的中文
+        // 会让 stdout 解不出合法 JSON，被测的是「改写有没有生效」而不是代码页。
+        std::fs::write(&path, format!("@echo off\r\necho {json}\r\n")).unwrap();
+        crate::hooks::HookDecl {
+            matcher: "runner".into(),
+            command: "cmd".into(),
+            args: vec!["/C".into(), path.display().to_string()],
+            timeout_ms: Some(5_000),
+        }
+    }
+
+    /// 装一份 hooks.json 并把里面的声明全信任。
+    #[cfg(windows)]
+    fn arm_hooks(
+        dir: &std::path::Path,
+        event: crate::hooks::HookEvent,
+        decl: &crate::hooks::HookDecl,
+    ) {
+        let cfg = serde_json::json!({
+            "enabled": true,
+            "events": { event.as_str(): [{
+                "matcher": decl.matcher, "command": decl.command, "args": decl.args,
+                "timeout_ms": 5_000
+            }]}
+        });
+        std::fs::write(dir.join(crate::hooks::HOOKS_FILE), cfg.to_string()).unwrap();
+        let loaded = crate::hooks::load_config(dir);
+        let stored = loaded.decls(event)[0].clone();
+        let mut trust = crate::hooks::TrustStore::default();
+        trust.grant(&stored.digest(event));
+        trust.save(dir).unwrap();
+    }
+
+    /// G44+ 的核心不变量：hook 改写入参之后，**工具执行的必须是改写后的那一份**。
+    /// 权限门看的是同一个 `view`（见 run 循环里重建 view 的位置），所以这条同时
+    /// 意思是「门不会为一组它没见过的入参背书」——门侧的半边由
+    /// `a_rewritten_input_is_what_the_gate_judges` 单独盯。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_hook_can_rewrite_the_tool_input() {
+        let hooks_dir = tempfile::tempdir().unwrap();
+        let decl = hook_script(
+            hooks_dir.path(),
+            r#"{"updated_input":{"command":"echo rewritten"}}"#,
+        );
+        arm_hooks(hooks_dir.path(), crate::hooks::HookEvent::PreToolUse, &decl);
+
+        let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let tool = Arc::new(RecordingTool(seen.clone()));
+        let model = ScriptedModel::new(vec![
+            tool_round(1, &[("runner", r#"{"command":"echo original"}"#)]),
+            deltas(&["好"]),
+        ]);
+        let recorder = model.recorder.clone();
+        let (session, sink, gate) = parts(
+            model,
+            ContextConfig::default(),
+            None,
+            vec![tool],
+            Vec::new(),
+        );
+        let mut rig = Rig {
+            session: session.with_config(SessionConfig {
+                hooks: Some(crate::hooks::HookRuntime::user_only(hooks_dir.path())),
+                ..Default::default()
+            }),
+            sink,
+            gate,
+            recorder,
+        };
+
+        assert_eq!(rig.run("跑一条").await, StopReason::EndTurn);
+        let calls = seen.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "工具应当被执行一次：{calls:?}");
+        assert_eq!(
+            calls[0].get("command").and_then(|v| v.as_str()),
+            Some("echo rewritten"),
+            "工具收到的必须是改写后的入参：{:?}",
+            calls[0]
+        );
+        // 改写不是静默的：通知条上有一条说明。
+        let notes: Vec<String> = rig
+            .sink
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                AgentEvent::Error { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notes.iter().any(|n| n.contains("改写")),
+            "改写必须在界面上可见：{notes:?}"
+        );
+        assert_every_request_paired(&rig);
+    }
+
+    /// 门这一侧：**规则命中按改写后的入参算**。
+    ///
+    /// 规则写的是 `rm *` → deny，模型原本要跑 `ls`，hook 把它改成 `rm -rf /important`。
+    /// 若门按原入参判定，`ls` 就该走 Trusted 直通 —— 于是「一次被批准的 ls」变成了
+    /// 一条被禁止的命令被执行。这条测试在改写不生效时会**干净地失败**（工具真的跑了），
+    /// 而不是挂住等弹窗：Trusted 档不弹窗。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_rewritten_input_is_what_the_gate_judges() {
+        use crate::settings::PermissionMode;
+        let hooks_dir = tempfile::tempdir().unwrap();
+        let decl = hook_script(
+            hooks_dir.path(),
+            r#"{"updated_input":{"command":"rm -rf /important"}}"#,
+        );
+        // `hook_script` 的默认 matcher 是 `runner`（Read 档那条测试的工具名）；
+        // 这条要用 Exec 档的 `exec_runner`，必须改 matcher —— 否则 hook 根本不命中。
+        let decl = crate::hooks::HookDecl {
+            matcher: "exec_runner".into(),
+            ..decl
+        };
+        arm_hooks(hooks_dir.path(), crate::hooks::HookEvent::PreToolUse, &decl);
+
+        let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let tool = Arc::new(ExecRecordingTool(seen.clone()));
+        let model = ScriptedModel::new(vec![
+            tool_round(1, &[("exec_runner", r#"{"command":"ls"}"#)]),
+            deltas(&["收到"]),
+        ]);
+        let recorder = model.recorder.clone();
+        let (session, sink, gate) = parts(
+            model,
+            ContextConfig::default(),
+            None,
+            vec![tool],
+            Vec::new(),
+        );
+        // 规则表：exec_runner 的 `rm *` 一律 deny。
+        gate.set_rules_from_json(&serde_json::json!({
+            "exec_runner": [{ "pattern": "rm *", "action": "deny" }]
+        }))
+        .unwrap();
+        gate.set_permission_mode(PermissionMode::Trusted);
+        let mut rig = Rig {
+            session: session.with_config(SessionConfig {
+                hooks: Some(crate::hooks::HookRuntime::user_only(hooks_dir.path())),
+                ..Default::default()
+            }),
+            sink,
+            gate,
+            recorder,
+        };
+
+        assert_eq!(rig.run("跑一下").await, StopReason::EndTurn);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "改写后的 rm 必须被规则拦下，工具不能执行：{:?}",
+            seen.lock().unwrap()
+        );
+        let results = rig.sink.tool_results();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1, "以错误结果回给模型：{:?}", results[0]);
+        assert!(
+            results[0].2.contains("权限规则拒绝"),
+            "拒绝理由要点名权限规则：{:?}",
+            results[0]
+        );
+        assert_every_request_paired(&rig);
+    }
+
+    /// 没配 hooks 时一切照旧（改造不许改变既有行为）。
+    #[tokio::test]
+    async fn without_hooks_the_tool_input_is_untouched() {
+        let (mut rig, counter) = Rig::with_counted(vec![
+            tool_round(1, &[("counted", r#"{"k":1}"#)]),
+            deltas(&["好"]),
+        ]);
+        // Write 档：需要一次放行。
+        let _answer = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("跑").await, StopReason::EndTurn);
+        assert_eq!(counter.calls().len(), 1);
+        assert!(
+            counter.calls()[0].contains("\"k\":1"),
+            "入参原样送达：{:?}",
+            counter.calls()
+        );
     }
 
     // ───────────────────────── G17：AGENTS.md 注入 ─────────────────────────

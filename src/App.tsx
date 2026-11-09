@@ -945,7 +945,10 @@ export default function App() {
       ) : null}
       {mcpOpen ? <McpPanel onClose={() => setMcpOpen(false)} /> : null}
       {hooksOpen ? (
-        <HooksPanel onClose={() => setHooksOpen(false)} />
+        <HooksPanel
+          sessionId={activeId}
+          onClose={() => setHooksOpen(false)}
+        />
       ) : null}
       {skillsOpen ? (
         <SkillsPanel

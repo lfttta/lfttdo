@@ -111,17 +111,33 @@ export const searchSessionFiles = (sessionId: string, query: string) =>
   invoke<string[]>("session_search_files", { sessionId, query });
 
 /**
- * G44：hooks 面板的数据（声明列表 + 每条信任状态）。`digest` 是信任/撤销的键，
- * 绑定**当前声明内容** —— hooks.json 一改，旧 digest 自然失效（回到未信任）。
+ * G44/G44+：hooks 面板的数据（用户作用域 + 工作区作用域的声明列表 + 每条信任状态）。
+ * `digest` 是信任/撤销的键，已带作用域前缀；它绑定**当前声明内容** ——
+ * hooks.json 一改，旧 digest 自然失效（回到未信任）。
+ * `sessionId` 决定「工作区是哪个」：面板永远为正在说话的那个会话展示。
  */
-export const hooksList = () => invoke<HooksView>("hooks_list");
+export const hooksList = (sessionId?: string) =>
+  invoke<HooksView>("hooks_list", { sessionId: sessionId ?? null });
 /** 信任 / 撤销一条 hook。撤销后它立刻停止执行（下一轮生效）。 */
 export const hooksSetTrusted = (
   digest: string,
   trusted: boolean,
 ): Promise<void> => invoke("hooks_set_trusted", { digest, trusted });
-/** 打开数据目录（去改 hooks.json）。 */
-export const hooksOpenFolder = (): Promise<void> => invoke("hooks_open_folder");
+/** G44+：打开/关闭工作区级 hooks 的总开关（默认关；打开后仍要逐条信任）。 */
+export const hooksSetWorkspaceEnabled = (enabled: boolean): Promise<void> =>
+  invoke("hooks_set_workspace_enabled", { enabled });
+/**
+ * 打开 hooks 所在目录。默认是用户数据目录；`workspace: true` 时打开当前会话工作区的
+ * `.lfttdo/`（目录不存在会先建出来）。
+ */
+export const hooksOpenFolder = (
+  sessionId?: string,
+  workspace?: boolean,
+): Promise<void> =>
+  invoke("hooks_open_folder", {
+    sessionId: sessionId ?? null,
+    workspace: workspace ?? false,
+  });
 
 /**
  * `settings_get` 返回**拍平一层**的 `SettingsView`（`ipc.rs:488-500` 的 `#[serde(flatten)]`），

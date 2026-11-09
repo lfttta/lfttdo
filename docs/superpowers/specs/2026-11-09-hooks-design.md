@@ -93,6 +93,16 @@ stdin 收一个 JSON 对象，stdout 回一个 JSON 对象（**stdout 只承载�
 
 ## 不做（本轮）
 
-- 工作区级 hooks（克隆仓库自带的风险面，需更完整的信任 UX）
-- `updatedInput`（改写工具入参——改写是新的注入面，留给下一轮）
-- 异步 hooks
+- 异步 hooks（同步语义才能拦；`Stop` 的 fire-and-forget 由 hook 自己的超时兜住）
+
+## 后续轮次已补上（2026-11-09 上午）
+
+- **工作区级 hooks 已做**（`<workspace>/.lfttdo/hooks.json`）：**两把锁** ——
+  `TrustStore.workspace_enabled` 默认关（克隆仓库自带 hooks 是最高风险输入面），
+  打开后仍要逐条 digest 信任；信任键带 `ws:<工作区路径摘要>:` 前缀，
+  所以**信任按路径绑定**（仓库 A 信任过的同内容声明不会让仓库 B 也变已信任）。
+  用户作用域的前缀是空串 —— v0.2.0 的旧信任表继续有效。
+- **`updatedInput` 已做**：`HookOutput.updated_input` 只收 JSON 对象；折叠规则是
+  「声明顺序里最后一条说了算」（串行叠加的语义是「谁先谁赢一半」，用户无从预期）。
+  **改写之后权限门看的是改写后的入参** —— 拿旧 view 判新入参等于给 hook 一张
+  绕过权限门的通行证。改写同时进通知条（不静默）。
