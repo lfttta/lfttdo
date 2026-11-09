@@ -117,9 +117,24 @@ Rust 侧需 MSVC 工具链：默认工具链不是 MSVC 的机器，用 `rustup 
 字符的仓库路径下链接器会崩）。仓库路径含非 ASCII 字符时，aws-lc-sys 的 NASM 构建步骤也会失败，
 可设 `AWS_LC_SYS_PREBUILT_NASM=1` 改用预编译汇编，或把仓库放到纯 ASCII 路径。
 
-当前读数：Rust 957 passed / 1 ignored + 集成 28 passed（gapcheck 12 + gapcheck2 15）；前端 308 passed；clippy 无新增
+当前读数：**Rust 1016 passed / 1 ignored + 集成 3 passed；前端 354 passed**；clippy 无新增
 （Windows 目标也已是 `-D warnings` 门禁）。权限分段、实验与诊断相关用例带 Windows 镜像：push 后 windows-latest
 会实跑同一逻辑（`run_command` 的 shell 执行用例仍为 unix 专属——sh 语法）。
+
+> **CI 的 clippy 在 ubuntu 上跑**：`#[cfg(windows)]` 代码引用的**任何项**（常量、测试替身结构体、
+> 它们的 `impl`）都必须自己挂 cfg，否则 Linux 侧报 `never constructed` / `never used`。
+
+### 会话级回归评测（不进 CI）
+
+```bash
+node scripts/eval/run.mjs --dry     # 看将跑哪些用例（含端点可达性）
+node scripts/eval/run.mjs           # 需要真实模型端点（默认本机 Ollama）
+node scripts/eval/run.mjs --boot-only   # 只验启动层，不需要模型
+```
+
+两层判定：**启动层**（GUI 起得来、隔离、进程树回收）与**会话层**（`--headless` 真跑一轮，
+断言工具序列 / `stop_reason` / 产物 / 关键词）。端点不可达时会话层**明确失败**，
+不会静默跳过。详见 `scripts/eval/README.md`。
 
 ## 目录结构
 
@@ -132,8 +147,13 @@ src-tauri/src/
   permission/       权限门与信任档
   mcp/              mcp.json 读取/编辑、工具命名、stdio / HTTP 桥、进程树回收
   store/            SQLite 会话与长期记忆持久化
+  headless.rs       `--headless` 命令行入口（不开窗口跑一轮，事件流打 NDJSON）
+  hooks.rs          用户 hook（声明解析 / digest 信任 / 子进程执行 / 输出解析）
+  ipc.rs            Tauri 装配根与全部命令（**唯一允许 `use tauri` 的文件**）
+  ipc/tests.rs      ipc 层的测试（从 ipc.rs 拆出：3985 行装配 vs 6518 行测试分开看）
   image_prep.rs     图片归一化
-docs/               设计、计划与验证记录
+docs/               设计、计划与验证记录（superpowers/specs 是设计文档，plans 是实施计划）
+scripts/eval/       会话级回归评测（外部启动器 + 案例集，不进 CI）
 release/            本地发布说明与各版本源码归档（gitignored，不参与构建）
 ```
 
@@ -148,6 +168,11 @@ release/            本地发布说明与各版本源码归档（gitignored，�
 - **人设导出不能选路径**：走 WebView 下载，默认落到系统下载目录；暂不支持“另存为”。
 - 内置联网抓取只抓公开网页，需要登录的页面抓不到。
 - **「重试这一轮」只删对话行，不回滚副作用**：该轮里工具写过的文件、执行过的命令不会撤销；被上下文压缩掉的历史已物理删除，重试也找不回来。
+- **`--headless` 不模拟点「允许」**：它没有可应答的界面，所以 Write/Exec 级工具会以
+  `没有可应答的界面` 被拒（比 GUI 更严，不是为评测放宽权限）。也不跑空闲记忆抽取、不连 MCP。
+  超时是「放弃等待」而非优雅中断 —— 进程退出后仍在写盘的工具可能留下半截产物。
+- **工作区级 hooks 的总开关默认关，且默认不可见**：关着时面板里不列出工作区的 hook
+  （列出来再标「未启用」容易让人以为勾一下信任就够了）。打开它是一次独立动作 + 二次确认。
 - 写文件只处理 UTF-8 文本：单次写入 ≤ 256 KiB，已有目标与编辑结果 ≤ 4 MiB；GBK 等编码、含 NUL 的内容、以及 `edit_file` 遇到 LF/CRLF 混用的文件都会被拒绝，不做转码。
 - 工具图片缓存只增不减：缓存现在写在各会话的输出目录（`<输出目录>/images/`），可手工清理；重开旧会话时会按需从会话库重建。打开文件位置只允许 roots 或该会话输出目录内的已存在路径。
 - **视频产物尚未处理**：当前只识别工具返回的文本和图片；ComfyUI 返回的视频（URL/文件/Blob）还不会自动落盘或播放，等拿到真实返回样例后再补。
@@ -164,6 +189,11 @@ release/            本地发布说明与各版本源码归档（gitignored，�
   前台命令结束整棵进程树被回收，不留后台进程。`background: true` 的后台任务不随「停止」中断，
   以超时为唯一终点，到点同样回收整棵进程树。
 - 应用内配置编辑器会把 `mcp.json` 原文（含 env/headers）显示在界面里；MCP 列表与状态命令始终不返回这些值。
+- **hook 是任意代码执行，信任绑定声明内容的 SHA-256**：文件改一个字符就回到「未信任」，
+  权限模式里的「信任模式」也不会自动信任 hook。但 hook **不是安全策略** —— 它自己也可能有 bug，
+  权限门与路径校验仍然是防线。
+- **`updated_input` 改写后，权限门看的是改写后的入参**：拿原入参判定等于给 hook 一张绕过权限门的
+  通行证。改写会进通知条（不静默）；多条 hook 同时改写时以声明顺序最后一条为准。
 - Markdown 链接经 `open_url` 交给系统默认浏览器（只允许 http/https），不导航 WebView；
   WebView 顶层导航另有白名单（只放行应用自身来源与本机开发服务器）。
 
