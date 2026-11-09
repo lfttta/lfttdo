@@ -108,6 +108,8 @@ export interface SkillView {
   name: string;
   description: string;
   folder: string;
+  /** G41：参数提示（slash 菜单展示），frontmatter 没写就是 null。 */
+  argument_hint: string | null;
   enabled: boolean;
 }
 

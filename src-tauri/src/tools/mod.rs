@@ -4,6 +4,8 @@ pub mod edit_file;
 pub mod experiment;
 pub mod fetch;
 pub mod fetch_guard;
+// G43：@文件提及的模糊搜索（供 IPC 的 `session_search_files`，不是模型工具）。
+pub(crate) mod file_search;
 pub(crate) mod fs_write;
 pub mod glob;
 pub mod grep;

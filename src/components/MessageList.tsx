@@ -96,6 +96,7 @@ export function MessageList({
   onRevealPath,
   onAnswerQuestion,
   onRetryLast,
+  onFollowUp,
 }: {
   state: UiState;
   onRespond: (id: string, d: Decision) => void;
@@ -110,6 +111,8 @@ export function MessageList({
   onAnswerQuestion?: (id: string, choice: string) => void;
   /** G39：「重试最后一轮」的出口（App 接截断→重放→重发链）；缺省 = 按钮不渲染。 */
   onRetryLast?: () => void;
+  /** G40：render_html 页面回流的出口（App 接 send）；缺省 = 确认条不渲染发送钮。 */
+  onFollowUp?: (prompt: string) => void;
 }) {
   const lastTurn = state.turns.length - 1;
 
@@ -182,6 +185,7 @@ export function MessageList({
             onOpenLink={onOpenLink}
             onRevealPath={onRevealPath}
             onRetry={onRetryLast}
+            onFollowUp={onFollowUp}
           />
         ))}
       </div>

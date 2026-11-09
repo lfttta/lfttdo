@@ -1779,11 +1779,18 @@ pub async fn send_message(
     // 这一段没法单测（`#[tauri::command]` 在单测里调不动，同上面 shell catalog 那行）：
     // 解析/替换/Err 语义由 `gate.rs` 的内联测试钉着，端到端行为由 `tests/gapcheck2.rs`
     // 的 G13 验收测试钉着。
+    let mut rules_warning: Option<String> = None;
     match &settings.permission_rules {
         Some(v) => {
             if let Err(reason) = state.gate.set_rules_from_json(v) {
                 tracing::warn!("permission_rules 形状非法，本轮忽略并清空规则：{reason}");
                 state.gate.rules().clear_tool_rules();
+                // 债④（2026-11-09）：只写日志用户永远不知道自己写的规则没生效。
+                // 文案暂存，等 emitter 就绪后发**非致命** error —— 前端进通知条，
+                // 「规则被忽略」在界面上可见（不拦停消息，fail-safe 语义不变）。
+                rules_warning = Some(format!(
+                    "permission_rules 形状非法，已忽略并清空（{reason}）；修正设置后下一条消息生效"
+                ));
             }
         }
         None => state.gate.rules().clear_tool_rules(),
@@ -1852,6 +1859,14 @@ pub async fn send_message(
     // 会话作用域在**真正开跑**之前对齐：配置/凭据失败的那次发送没有开跑，
     // 不该顺手清掉上一轮用户答过的授权。
     enter_session_scope(&state.last_session, &state.gate, &session_id);
+    // 债④：规则被忽略的通知在 emitter 就绪后补发（非致命 error → 前端通知条）。
+    if let Some(warning) = rules_warning {
+        emitter.emit(AgentEvent::Error {
+            at: ErrorWhere::Store,
+            message: warning,
+            fatal: false,
+        });
+    }
     // G19：激活的 agent 档案。prompt 是**整段替换**（与用户人设同一语义）且
     // **优先于人设**——档案是「这个会话此刻是谁」的完整定义，人设只是它的缺省。
     // tools 白名单交给会话双层执行（声明表过滤 + 循环拦截，见 session.rs）。
@@ -2246,6 +2261,8 @@ pub struct SkillView {
     pub name: String,
     pub description: String,
     pub folder: String,
+    /// G41：参数提示（slash 菜单展示用），没写就是 `None`。
+    pub argument_hint: Option<String>,
     /// 选择表里是否启用。停用的技能仍列出来（否则用户没法重新打开）。
     pub enabled: bool,
 }
@@ -2268,6 +2285,7 @@ pub(crate) fn skills_view_of(dir: &Path, sel: &crate::skills::Selection) -> Skil
                 name: e.name,
                 description: e.description,
                 folder: e.folder,
+                argument_hint: e.argument_hint,
             })
             .collect(),
     }
@@ -2480,6 +2498,33 @@ pub async fn session_workspace_set(
     blocking(move || {
         db.set_session_workspace(&id, stored.as_deref())
             .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// G43：@文件提及的浮层数据。搜索范围 = 全局 roots + 当前会话的输出目录
+/// （`resolve_session_output` 的既有裁定：工作文件夹优先于默认储存位置）。
+/// 文件名 / 相对路径子串匹配、浅层优先、上限 [`crate::tools::file_search::DEFAULT_LIMIT`]。
+/// 搜索逻辑与剪枝规则在 `tools/file_search.rs`（纯函数、独立单测），这里只装配范围。
+#[tauri::command]
+pub async fn session_search_files(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    query: String,
+) -> Result<Vec<String>, String> {
+    let store = state.settings.clone();
+    let settings = blocking(move || store.load().map_err(|e| e.to_string())).await?;
+    let mut roots = settings.roots.clone();
+    if let Ok(dir) = resolve_session_output(&app, &state, &settings, &session_id) {
+        roots.push(dir);
+    }
+    blocking(move || {
+        Ok(crate::tools::file_search::search(
+            &roots,
+            &query,
+            crate::tools::file_search::DEFAULT_LIMIT,
+        ))
     })
     .await
 }
@@ -3679,6 +3724,7 @@ pub fn run() {
             session_messages,
             session_export,
             session_retry_last,
+            session_search_files,
             session_output_view,
             session_workspace_set,
             memories_list,

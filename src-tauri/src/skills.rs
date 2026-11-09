@@ -30,6 +30,9 @@ pub const SELECTION_FILE: &str = "skills.json";
 pub const MAX_SKILLS: usize = 50;
 pub const MAX_NAME_CHARS: usize = 40;
 pub const MAX_DESCRIPTION_CHARS: usize = 160;
+/// G41：参数提示的上限。它在 slash 菜单里跟在描述后面，写长了把一行挤爆；
+/// 60 字符够说清「参数写什么」（如「要翻译的句子」）。
+pub const MAX_ARGUMENT_HINT_CHARS: usize = 60;
 /// 单份技能正文的上限。技能是给人读的操作说明，不承担传大段资料的角色。
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// 本轮自动加载的技能份数上限：本地小模型一次吞两份长正文就会开始漏看步骤。
@@ -55,6 +58,9 @@ pub struct SkillEntry {
     /// 触发词（frontmatter `keywords` / `关键词`，已转小写）：用户这句话里出现它们
     /// 就把正文直接加载进本轮，不赌模型自己想到要调 `use_skill`。
     pub keywords: Vec<String>,
+    /// G41：参数提示（frontmatter `argument-hint` / `参数提示`）。只进 slash 菜单给
+    /// 人看（「这条技能可以带参数、参数写什么」），不进系统提示 —— 模型不需要它。
+    pub argument_hint: Option<String>,
     /// 文件夹名：模型用中文名或目录名都能取到同一份技能。
     pub folder: String,
     /// 已验证位于技能根之内的 SKILL.md。
@@ -141,6 +147,7 @@ pub fn discover(dir: &Path) -> Vec<SkillEntry> {
             name: parsed.name,
             description: parsed.description,
             keywords: parsed.keywords,
+            argument_hint: parsed.argument_hint,
             folder,
             path: real,
         });
@@ -331,11 +338,12 @@ struct Parsed {
     name: String,
     description: String,
     keywords: Vec<String>,
+    argument_hint: Option<String>,
     body: String,
 }
 
 /// 容错解析：frontmatter 缺什么就用正文/文件夹名补什么。
-/// 项目不引 YAML 依赖 —— 只需要 name / description / keywords 三个键，
+/// 项目不引 YAML 依赖 —— 只需要 name / description / keywords 等少数几个键，
 /// 手写这几行比多一个解析库划算。
 fn parse(raw: &str, folder: &str) -> Parsed {
     let text = raw.trim_start_matches('\u{feff}').replace("\r\n", "\n");
@@ -343,6 +351,7 @@ fn parse(raw: &str, folder: &str) -> Parsed {
     let mut name = String::new();
     let mut description = String::new();
     let mut keywords: Vec<String> = Vec::new();
+    let mut argument_hint: Option<String> = None;
     if let Some(header) = header {
         for line in header.lines() {
             let Some((key, value)) = line.split_once(':') else {
@@ -358,6 +367,11 @@ fn parse(raw: &str, folder: &str) -> Parsed {
                 "name" | "名称" => name = value,
                 "description" | "描述" => description = value,
                 "keywords" | "关键词" => keywords = split_keywords(&value),
+                // G41：空值按「没写」处理，与缺键同一形态；截断防线与 description 同理。
+                "argument-hint" | "参数提示" => {
+                    argument_hint =
+                        (!value.is_empty()).then(|| one_line(&value, MAX_ARGUMENT_HINT_CHARS))
+                }
                 _ => {}
             }
         }
@@ -393,6 +407,7 @@ fn parse(raw: &str, folder: &str) -> Parsed {
         name: one_line(&name, MAX_NAME_CHARS),
         description: one_line(&description, MAX_DESCRIPTION_CHARS),
         keywords,
+        argument_hint,
         body,
     }
 }
@@ -733,6 +748,56 @@ mod tests {
         assert_eq!(matched(&entries, "使用「翻译助手」技能：hi", 2).len(), 1);
         // 无关的话一条都不命中。
         assert!(matched(&entries, "今天天气怎么样", 2).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // G41：argument-hint 解析 —— 有值带出、空值与缺键同为 None、超长截断。
+    // 它只进 slash 菜单给人看，解析错不致命，但「写了 hint 却显示不出来」会让
+    // 用户以为这条技能不能带参数。
+    #[test]
+    fn argument_hint_is_parsed_with_empty_and_missing_as_none() {
+        let root = tmp_dir("arghint");
+        write_skill(
+            &root,
+            "with-hint",
+            "---\nname: 带参数\ndescription: d\nargument-hint: 要翻译的句子\n---\n正文\n",
+        );
+        write_skill(
+            &root,
+            "empty-hint",
+            "---\nname: 空参数\ndescription: d\nargument-hint:\n---\n正文\n",
+        );
+        write_skill(
+            &root,
+            "no-hint",
+            "---\nname: 无参数\ndescription: d\n---\n正文\n",
+        );
+        write_skill(
+            &root,
+            "long-hint",
+            &format!(
+                "---\nname: 超长\ndescription: d\nargument-hint: {}\n---\n正文\n",
+                "长".repeat(80)
+            ),
+        );
+        let entries = discover(&root);
+        let hint_of = |folder: &str| {
+            entries
+                .iter()
+                .find(|e| e.folder == folder)
+                .unwrap()
+                .argument_hint
+                .clone()
+        };
+        assert_eq!(hint_of("with-hint").as_deref(), Some("要翻译的句子"));
+        assert_eq!(hint_of("empty-hint"), None, "空值按没写处理");
+        assert_eq!(hint_of("no-hint"), None);
+        let long = hint_of("long-hint").expect("超长也应有值（截断）");
+        // one_line 的契约：截到上限并追加一个省略号（description 同款）。
+        assert!(
+            long.chars().count() <= MAX_ARGUMENT_HINT_CHARS + 1 && long.ends_with('…'),
+            "超长要截到上限并带省略号：{long}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

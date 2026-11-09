@@ -142,10 +142,14 @@ function toolPathOf(input: unknown): string | null {
 
 function ToolCardView({
   card,
+  streaming,
   onRevealPath,
+  onFollowUp,
 }: {
   card: ToolCard;
+  streaming: boolean;
   onRevealPath?: (path: string) => void;
+  onFollowUp?: (prompt: string) => void;
 }) {
   const path = toolPathOf(card.input);
   // G32：render_html 有专属卡片 —— 原始 html 不再以 JSON 形式倾倒在 <pre> 里，
@@ -171,7 +175,12 @@ function ToolCardView({
           {JSON.stringify(card.input ?? {}, null, 2)}
         </pre>
       ) : (
-        <RenderedHtmlCard html={render.html} title={render.title} />
+        <RenderedHtmlCard
+          html={render.html}
+          title={render.title}
+          streaming={streaming}
+          onFollowUp={onFollowUp}
+        />
       )}
       {(() => {
         const shown = card.preview ? readablePreview(card.preview) : "";
@@ -236,22 +245,87 @@ function renderInputOf(input: unknown): RenderInput | null {
 }
 
 /**
- * G32：render_html 的内嵌渲染。`sandbox=""` 是整个安全模型的落点：独立源、禁脚本、
- * 禁表单 —— 交付物只能是静态 HTML/CSS/SVG。data URL 让零配置的本地渲染成为可能
- * （不启 asset 协议、不加 IPC 读回命令）；「放大」只改高度，不离开聊天流。
+ * G32/G40：render_html 的内嵌渲染。`sandbox="allow-scripts"`（无 allow-same-origin）
+ * 是整个安全模型的落点：脚本可跑（交互式页面），但源是 opaque——读不到父页面、
+ * localStorage，唯一出口是 `window.parent.postMessage`。data URL 让零配置的本地
+ * 渲染成为可能（不启 asset 协议、不加 IPC 读回命令）；「放大」只改高度，不离开聊天流。
+ *
+ * G40 回流：页面可以用 `postMessage({type:"lfttdo:followup", prompt:"…"}, "*")` 请求
+ * 把一句话送回对话。**不直接发**——模型生成的页面不可信（可能被诱导刷屏/注入话术），
+ * 收到后先落成卡片内的确认条，由用户点了「发送」才走对话；来源校验钉死在本卡片的
+ * iframe（`event.source`），别的窗口/iframe 冒充无效。超长截断到 2000 字符。
  */
-function RenderedHtmlCard({ html, title }: { html: string; title: string | null }) {
+const FOLLOWUP_MAX_CHARS = 2_000;
+
+function RenderedHtmlCard({
+  html,
+  title,
+  streaming,
+  onFollowUp,
+}: {
+  html: string;
+  title: string | null;
+  streaming: boolean;
+  onFollowUp?: (prompt: string) => void;
+}) {
   const [expanded, setExpanded] = useState(false);
+  const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
+  const frameRef = useRef<HTMLIFrameElement | null>(null);
   const src = `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      if (e.source !== frameRef.current?.contentWindow) return;
+      const data = e.data as { type?: unknown; prompt?: unknown } | null;
+      if (
+        data === null ||
+        typeof data !== "object" ||
+        data.type !== "lfttdo:followup" ||
+        typeof data.prompt !== "string" ||
+        data.prompt.trim() === ""
+      ) {
+        return;
+      }
+      setPendingPrompt(data.prompt.trim().slice(0, FOLLOWUP_MAX_CHARS));
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
   return (
     <div className="rendered-html" data-testid="rendered-html">
       {title === null ? null : <div className="rendered-title">{title}</div>}
       <iframe
+        ref={frameRef}
         className={expanded ? "rendered-frame expanded" : "rendered-frame"}
-        sandbox=""
+        sandbox="allow-scripts"
         src={src}
         title={title ?? "渲染结果"}
       />
+      {pendingPrompt === null ? null : (
+        <div className="followup-strip" data-testid="followup-strip">
+          <span className="followup-text">页面请求发送：{pendingPrompt}</span>
+          <button
+            type="button"
+            className="followup-send"
+            disabled={streaming || !onFollowUp}
+            data-testid="followup-send"
+            onClick={() => {
+              const prompt = pendingPrompt;
+              setPendingPrompt(null);
+              onFollowUp?.(prompt);
+            }}
+          >
+            发送到对话
+          </button>
+          <button
+            type="button"
+            className="followup-dismiss"
+            data-testid="followup-dismiss"
+            onClick={() => setPendingPrompt(null)}
+          >
+            忽略
+          </button>
+        </div>
+      )}
       <div className="rendered-foot">
         <button
           type="button"
@@ -428,15 +502,20 @@ function Thinking({ text, answer }: { text: string; answer: string }) {
 function BlockView({
   block,
   plain,
+  streaming,
   onRespond,
   onOpenLink,
   onRevealPath,
+  onFollowUp,
 }: {
   block: UiBlock;
   plain: boolean;
+  /** G40：透传给 render_html 卡片（流式中禁用「发送到对话」）。 */
+  streaming: boolean;
   onRespond: (id: string, d: Decision) => void;
   onOpenLink?: (url: string) => void;
   onRevealPath?: (path: string) => void;
+  onFollowUp?: (prompt: string) => void;
 }) {
   switch (block.kind) {
     case "text": {
@@ -504,7 +583,14 @@ function BlockView({
         />
       );
     case "tool":
-      return <ToolCardView card={block} onRevealPath={onRevealPath} />;
+      return (
+        <ToolCardView
+          card={block}
+          streaming={streaming}
+          onRevealPath={onRevealPath}
+          onFollowUp={onFollowUp}
+        />
+      );
     case "perm":
       return <PermCardView card={block} onRespond={onRespond} />;
   }
@@ -531,6 +617,7 @@ function MessageBubbleView({
   onOpenLink,
   onRevealPath,
   onRetry,
+  onFollowUp,
 }: {
   turn: Turn;
   isLastTurn: boolean;
@@ -544,6 +631,8 @@ function MessageBubbleView({
    * 那是另一个功能）。动作本身在 App：截断 → 重放 → 重发，这里只是一个按钮。
    */
   onRetry?: () => void;
+  /** G40：render_html 页面的回流出口（确认条点了「发送」才到这里）。 */
+  onFollowUp?: (prompt: string) => void;
 }) {
   const lastIndexOf = turn.blocks.length - 1;
   // R234：空的助手气泡有两种来路 —— 等首字（该留着并看得出在等）与这一轮已结束
@@ -566,9 +655,11 @@ function MessageBubbleView({
           key={i}
           block={b}
           plain={streaming && isLastTurn && i === lastIndexOf}
+          streaming={streaming}
           onRespond={onRespond}
           onOpenLink={onOpenLink}
           onRevealPath={onRevealPath}
+          onFollowUp={onFollowUp}
         />
       ))}
       {copyText === "" ? null : (

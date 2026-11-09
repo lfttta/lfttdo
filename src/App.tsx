@@ -872,6 +872,11 @@ export default function App() {
           onRevealPath={onRevealPath}
           onAnswerQuestion={onQuestionAnswer}
           onRetryLast={retryLast}
+          onFollowUp={(prompt) => {
+            // G40：页面回流已经过卡片内的人审确认条，这里直接走同一条 send
+            //（乐观插入/失败回滚/自动改名全套复用）。
+            void send([{ type: "text", text: prompt }]);
+          }}
         />
         <Composer
           streaming={ui.streaming}
@@ -880,6 +885,7 @@ export default function App() {
           onNormalize={normalize}
           seed={composerSeed}
           skillsLoader={api.skillsList}
+          filesLoader={(query) => api.searchSessionFiles(activeRef.current ?? "", query)}
         />
         {/* 没拿到 usage 事件就整行不渲染：常驻一句「尚未回报」是界面在替一个
             还没发生的事件说话，而且那一行永远占着状态栏的位置。 */}

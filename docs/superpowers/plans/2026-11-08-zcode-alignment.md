@@ -37,17 +37,29 @@
 
 **终态（2026-11-08 深夜）**：G35-G39、G42 全部落地并推送。第一轮 CI 7/8（`c9e2931` 的 DWM 常量在 Linux clippy 下 dead_code——`cfg(windows)` 函数引用的常量也要挂 cfg），补 `#[cfg(windows)]` 后复跑 **CI 8/8 全绿**（run 42493607254）。README 功能/已知限制已同步。下一批从 G40/G41 或 G43 起。
 
-## 后续批次（按序，每批先写 spec）
+## 第三轮批次（2026-11-09 深夜，同会话）—— G40/G41/G43 + 安全债全清
 
-| 编号 | 内容 | 关键落点 | 量级 | 备注 |
-|---|---|---|---|---|
-| G40 | render_html 交互闭环：widgetState 双分区（modelContent ≤16KiB 进上下文，privateContent 不进）+ sendFollowUpMessage | render_html.rs + iframe postMessage 桥 + ipc | M | 抄 ZCode UI_PLUGIN.md 的 widgetState 设计 |
-| G41 | slash 模板命令：SKILL.md frontmatter 加 argument-hint，正文 $ARGUMENTS/$1 展开 | skills.rs + Composer | M | 红线：模板内 shell 片段解析期绝不执行，只作为文本进消息 |
-| G43 | @文件提及：Composer @ 浮层防抖搜索，复用 glob 枚举（需新 ipc list_files） | Composer.tsx + tools/glob.rs | M | 给小模型精确路径锚点 |
-| G44 | hooks 机制：PreToolUse/PostToolUse/SessionStart/Stop 四事件 + digest 信任模型（内容哈希绑定信任，yolo 不自动信任，fail closed） | 新 hooks.rs + AgentEvent 挂点 + 设置 UI | L | 先写 spec；信任模型逐字参照 ZCode hooks.md |
-| G45 | 会话级回归评测：外部启动器跑案例集（prompt→期望工具序列/产物断言），证据归档（git SHA/版本/失败现场） | 仓库外脚本 + headless 入口 | M | 责任边界参照 ZCode usage/13：LFTTDO 只当执行器，隔离（HOME/数据目录）与评分归外部 |
-| — | 安全加固债 5 项（JobObject 孙进程回收 / experiment_run 接命令段规则 / websearch 复用 fetch_guard SSRF client / permission_rules 非法形状 UI 提示 / 非 Exec 工具 scope 补全） | 见 lfttdo-project-status | S×5 | 不阻塞，穿插做 |
-| — | ipc.rs 拆分（~1.9 万行单文件） | 按 G31/G32/G33 式分模块 | L | 做 G44 前顺手拆 |
+| 编号 | 内容 | 落点 | 状态 |
+|---|---|---|---|
+| G41 | slash 模板命令：SKILL.md `argument-hint`/`参数提示`（≤60 字符，菜单展示）+ Composer 提交时 `/技能 参数` 展开成标准引导语句式（未知名原样发，不猜） | skills.rs / ipc.rs SkillView / types.ts / Composer.tsx | ✅ Rust 1 条 + 前端 2 条新测试 |
+| G43 | @文件提及：新模块 `tools/file_search.rs`（子串匹配、浅层优先、跳 .git/node_modules/target/.lfttdo、深度 8、单根 4000 条预算）+ `session_search_files` 命令（roots + 会话输出目录）+ Composer @ 浮层（防抖 180ms、↑↓/Enter/Esc、`@词` 整体替换为路径）。与 glob 工具分工：glob 给模型按模式列文件，这个给人模糊找 | tools/file_search.rs / ipc.rs / commands.ts / Composer.tsx | ✅ Rust 4 条 + 前端 2 条新测试 |
+| G40 | render_html 回流闭环：沙箱 `sandbox=""` → `allow-scripts`（仍无同源）；页面 `postMessage({type:"lfttdo:followup",prompt})` → **确认条人审**（模型生成的页面不可信，回流必须过目；来源校验钉死本卡片 iframe、prompt 截 2000、流式中禁发）→ 用户点了才走同一条 send | MessageBubble.tsx(RenderedHtmlCard) / MessageList / App | ✅ 前端 2 条新测试 + sandbox 契约更新。widgetState 双分区（页面状态持久）留作后续增强 |
+| 债① | experiment 基准命令接 `KillOnCloseJob`（spawn 后 assign，任何出口 Drop 回收整棵树；失败退回 kill_on_drop 保底）。workflow 不直接 spawn（走子代理→shell 工具已有 job） | tools/experiment.rs run_command | ✅ |
+| 债② | gate 新增：experiment_run 的 `input.command` 按 `split_command_segments` 切段、查 **run_command 的规则表**——`rm *` → deny 不许在实验循环里被绕过；规则 allow 刻意不给 Write 档免弹窗 | permission/gate.rs | ✅ 2 条新测试 |
+| 债③ | websearch 端点请求前过 `check_url` + `resolve_target`（整集复验）。**如实标注残留**：判定后 reqwest 仍自行解析（TOCTOU 窗口）——钉地址要按次重建 client，端点恒定+判定先行已把窗口压到极低 | tools/websearch.rs guarded_endpoint | ✅ 2 条新测试（字面内网 IP） |
+| 债④ | permission_rules 形状非法时，除日志外**发非致命 error 事件**进前端通知条（「已忽略并清空，修正设置后下一条消息生效」）——fail-safe 语义不变，可见性补上 | ipc.rs send_message 装配段 | ✅（`#[tauri::command]` 不可单测，同既有段口径） |
+| 债⑤ | 非 Exec 工具凡带 `path` 参数的，G13 匹配串用路径本身——路径型规则（`write_file: [{pattern:"*/.env*"}]`）原来恒为空串永不命中。无 path 工具维持空串，`*` 通配行为不缩窄 | permission/gate.rs check | ✅ 1 条新测试 |
+
+**终验**：Rust 989 lib + 3 集成 / clippy 零警告 / fmt 干净 / 前端 344 / tsc / lint:css 全绿。教训：多根目录排序测试不许钉 tempdir 随机名的字典序（实测翻车）；`cargo test --all-targets` 与运行中的 dev 实例抢 `lfttdo.exe`（os error 5）——先停 dev。
+
+## 剩余排队
+
+| 编号 | 内容 | 量级 | 备注 |
+|---|---|---|---|
+| G44 | hooks 机制 | L | **先写 spec**；做前拆 ipc.rs |
+| — | ipc.rs 拆分（~2 万行） | L | G44 前置 |
+| G45 | 会话级回归评测 | M | 外部启动器 + 案例集 |
+| G40+ | widgetState 双分区（页面状态持久化） | M | 回流闭环已通，状态持久是增强 |
 
 ## 已明确不做 / 暂不做
 

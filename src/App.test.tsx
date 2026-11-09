@@ -26,10 +26,11 @@ const h = vi.hoisted(() => {
     skillsSetEnabled: vi.fn(),
     revealPath: vi.fn(),
     pickFolder: vi.fn(async (): Promise<string | null> => null),
-    // G38/G39：缺这两支的话，任何碰到「导出/重试」的用例会在 mock 工厂上抛
+    // G38/G39/G43：缺这几支的话，任何碰到「导出/重试/@提及」的用例会在 mock 工厂上抛
     // 「not a function」，把真正的断言失败淹掉 —— 与上面 flushMemory 同一条理由。
     exportSession: vi.fn(async (): Promise<string | null> => null),
     retryLastSession: vi.fn(async (): Promise<unknown[] | null> => null),
+    searchSessionFiles: vi.fn(async (): Promise<string[]> => []),
     sessionOutputView: vi.fn(async () => ({
       workspace: null,
       output_dir: "C:\\out\\session",
@@ -142,6 +143,7 @@ beforeEach(() => {
   h.skillsSetEnabled.mockReset().mockResolvedValue(undefined);
   h.exportSession.mockReset().mockResolvedValue(null);
   h.retryLastSession.mockReset().mockResolvedValue(null);
+  h.searchSessionFiles.mockReset().mockResolvedValue([]);
   h.replaySession.mockReset().mockResolvedValue([]);
   h.sessions.mockReset().mockResolvedValue([row("B", 2)]);
   h.createSession.mockReset().mockResolvedValue("N");
@@ -184,12 +186,14 @@ describe("App", () => {
           name: "翻译润色",
           description: "中英互译",
           folder: "translate",
+          argument_hint: null,
           enabled: true,
         },
         {
           name: "停用的",
           description: "不出现",
           folder: "off",
+          argument_hint: null,
           enabled: false,
         },
       ],
@@ -211,12 +215,98 @@ describe("App", () => {
     ).toBeNull();
   });
 
+  // G41：slash 菜单显示参数提示；`/技能 参数` 提交时展开成模型认识的引导语句式
+  // —— 展开只发生在发送那一刻，输入框里保留用户敲的原文。
+  it("G41: shows the argument hint and expands /skill args on submit", async () => {
+    h.skillsList.mockResolvedValue({
+      root: "E:\\skills",
+      skills: [
+        {
+          name: "翻译润色",
+          description: "中英互译",
+          folder: "translate",
+          argument_hint: "要翻译的句子",
+          enabled: true,
+        },
+      ],
+    });
+    render(<App />);
+    await settled();
+    const box = screen.getByLabelText("输入消息");
+    fireEvent.change(box, { target: { value: "/翻译" } });
+    const menu = await screen.findByRole("listbox", { name: "技能快捷菜单" });
+    expect(within(menu).getByText("· 要翻译的句子")).toBeInTheDocument();
+
+    // 带参数整句提交：走展开而不是原样发出。
+    fireEvent.change(box, { target: { value: "/翻译润色 Hello world" } });
+    fireEvent.keyDown(box, { key: "Enter", shiftKey: false });
+    await waitFor(() =>
+      expect(h.sendMessage).toHaveBeenCalledWith("B", [
+        { type: "text", text: "使用「翻译润色」技能：Hello world" },
+      ]),
+    );
+    // 输入框里的草稿按原文清空（展开是发送行为，不改用户敲的字）。
+    await waitFor(() => expect(box).toHaveValue(""));
+  });
+
+  // G41：`/未知名 参数`（不在技能表里）原样发送 —— 展开只对认得的技能生效，
+  // 不猜（用户可能在写普通文本）。
+  it("G41: sends /unknown args verbatim without expanding", async () => {
+    h.skillsList.mockResolvedValue({
+      root: "",
+      skills: [
+        { name: "翻译", description: "d", folder: "t", argument_hint: null, enabled: true },
+      ],
+    });
+    render(<App />);
+    await settled();
+    const box = screen.getByLabelText("输入消息");
+    fireEvent.change(box, { target: { value: "/notaskill 参数" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    await waitFor(() =>
+      expect(h.sendMessage).toHaveBeenCalledWith("B", [
+        { type: "text", text: "/notaskill 参数" },
+      ]),
+    );
+  });
+
+  // G43：@ 触发文件浮层（防抖后出现），点击把 `@词` 整体替换成绝对路径；
+  // 正文里的 a@b.com（@ 前没有空白）不触发。
+  it("G43: @ opens the file picker and selection replaces the word", async () => {
+    h.searchSessionFiles.mockResolvedValue([
+      "C:\\out\\a_main.rs",
+      "C:\\out\\nested\\b_main.rs",
+    ]);
+    render(<App />);
+    await settled();
+    const box = screen.getByLabelText("输入消息");
+    fireEvent.change(box, { target: { value: "看看 @" } });
+    // 防抖 180ms 后浮层才出现：waitFor 等 它，别同步断言。
+    const menu = await screen.findByRole("listbox", { name: "文件提及菜单" }, { timeout: 1_000 });
+    expect(within(menu).getByText("C:\\out\\a_main.rs")).toBeInTheDocument();
+    fireEvent.mouseDown(within(menu).getByText("C:\\out\\a_main.rs"));
+    // `@` 词整体替换成路径，尾补空格。
+    expect(box).toHaveValue("看看 C:\\out\\a_main.rs ");
+    expect(screen.queryByRole("listbox", { name: "文件提及菜单" })).toBeNull();
+  });
+
+  // G43：邮箱形如 a@b.com 的 @ 不在空白后，不弹浮层。
+  it("G43: an email-style at sign does not open the picker", async () => {
+    render(<App />);
+    await settled();
+    const box = screen.getByLabelText("输入消息");
+    fireEvent.change(box, { target: { value: "联系 a@b.com" } });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(screen.queryByRole("listbox", { name: "文件提及菜单" })).toBeNull();
+    expect(h.searchSessionFiles).not.toHaveBeenCalled();
+  });
+
   // G33：正文里的斜杠（/etc/hosts）不弹菜单；过滤无命中时菜单也不出现。
   it("does not open the slash menu for mid-text slashes or empty matches", async () => {
     h.skillsList.mockResolvedValue({
       root: "",
       skills: [
-        { name: "翻译", description: "d", folder: "t", enabled: true },
+        { name: "翻译", description: "d", folder: "t", argument_hint: null, enabled: true },
       ],
     });
     render(<App />);
@@ -274,6 +364,7 @@ describe("App", () => {
           name: "翻译润色",
           description: "中英互译",
           folder: "translate",
+          argument_hint: null,
           enabled: true,
         },
       ],
@@ -296,6 +387,7 @@ describe("App", () => {
           name: "翻译润色",
           description: "中英互译",
           folder: "translate",
+          argument_hint: null,
           enabled: true,
         },
       ],

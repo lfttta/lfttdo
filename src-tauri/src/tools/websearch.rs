@@ -103,6 +103,7 @@ impl SearchProvider for DdgProvider {
                 "构造搜索地址失败（端点是常量，这一支不该走到）：{e}"
             ))
         })?;
+        let url = guarded_endpoint(url).await?;
         let resp = self
             .http
             .get(url)
@@ -118,6 +119,28 @@ impl SearchProvider for DdgProvider {
             .map_err(|e| ToolError::Failed(format!("读取搜索结果失败：{e}")))?;
         ddg_respond(status, &body)
     }
+}
+
+/// 债③修复（2026-11-09）：搜索端点请求前过 fetch_guard 的同一套判定 ——
+/// `check_url`（方案/主机红线）+ `resolve_target`（地址集整集复验，内含
+/// `assert_all_public`）。端点虽是**编译期常量**，但 DDG 的 DNS 被劫持/重绑定
+/// 到内网时这条路径同样要把请求拦下，与 `fetch.rs` 的对外承诺一条线。
+///
+/// **如实标注的残留**：判定之后 reqwest 仍会自行解析 DNS（TOCTOU 窗口）——
+/// `fetch.rs` 能钉住已校验地址是因为它有自研 transport；这里用裸 client，
+/// 钉地址要按次重建 client（TLS 握手成本）+ 端口组装。端点恒定 + 判定先行
+/// 已把窗口压到「DDG 的 DNS 在两次解析之间被改写」这一档，权衡记在这里。
+async fn guarded_endpoint(url: Url) -> Result<Url, ToolError> {
+    let checked = crate::tools::fetch_guard::check_url(url.as_str())
+        .map_err(|e| ToolError::Failed(format!("搜索端点未通过安全判定：{e}")))?;
+    let resolver = crate::tools::fetch::SystemResolver;
+    tokio::task::spawn_blocking(move || {
+        crate::tools::fetch_guard::resolve_target(&checked, &resolver)
+    })
+    .await
+    .map_err(|e| ToolError::Failed(format!("安全判定任务失败：{e}")))?
+    .map_err(|e| ToolError::Failed(format!("搜索端点未通过地址级判定：{e}")))?;
+    Ok(url)
 }
 
 /// 「状态码 + 响应体」→ 结果或错误的**纯函数**（DdgProvider 的网络路径只是搬运）。
@@ -588,6 +611,24 @@ impl Tool for WebSearchTool {
 mod tests {
     use super::*;
     use tokio_util::sync::CancellationToken;
+
+    // 债③：搜索端点的 SSRF 判定 —— 字面内网 IP 不走 DNS，可直接钉住拒绝；
+    // 公网判定路径（DDG 域名）需要真 DNS，属「网络行为不进 CI」的同一标注。
+    #[tokio::test]
+    async fn a_loopback_endpoint_is_rejected_before_any_request() {
+        let url = Url::parse("http://127.0.0.1:9200/search?q=x").unwrap();
+        let err = guarded_endpoint(url).await.expect_err("环回地址必须被拒");
+        assert!(
+            err.to_string().contains("安全判定") || err.to_string().contains("环回"),
+            "报错要能看出是判定拦的：{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_private_range_endpoint_is_rejected_before_any_request() {
+        let url = Url::parse("http://10.0.0.5/search?q=x").unwrap();
+        assert!(guarded_endpoint(url).await.is_err(), "私网段必须被拒");
+    }
 
     fn ctx() -> ToolCtx {
         ToolCtx {

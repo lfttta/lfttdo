@@ -10,6 +10,7 @@ const enabledView: SkillsView = {
       name: "翻译润色",
       description: "中英互译",
       folder: "translate",
+      argument_hint: null,
       enabled: true,
     },
   ],

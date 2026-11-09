@@ -42,6 +42,7 @@ export function Composer({
   onNormalize,
   seed,
   skillsLoader,
+  filesLoader,
 }: {
   streaming: boolean;
   onSend: (blocks: SendBlock[]) => Promise<void>;
@@ -52,6 +53,11 @@ export function Composer({
   seed?: { id: number; text: string } | null;
   /** G33：slash 技能菜单的数据来源（App 接 `api.skillsList`）；缺省 = 菜单不启用。 */
   skillsLoader?: () => Promise<SkillsView>;
+  /**
+   * G43：@文件提及的搜索来源（App 接 `api.searchSessionFiles`，把会话 id 捕获进闭包）；
+   * 缺省 = 浮层不启用。防抖在组件内做，这里每次调用都是一次真实搜索。
+   */
+  filesLoader?: (query: string) => Promise<string[]>;
 }) {
   const [text, setText] = useState("");
   const [stopRequested, setStopRequested] = useState(false);
@@ -81,6 +87,11 @@ export function Composer({
   );
   const [slashIndex, setSlashIndex] = useState(0);
   const slashLoadedRef = useRef(false);
+  // G43：@文件提及浮层。`mentionQuery` 非 null = 浮层开着，值是 @ 后面的过滤词；
+  // 与 slash 菜单天然互斥（`/` 只认第 0 位无空格，`@` 必须在空白后）。
+  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  const [mentionItems, setMentionItems] = useState<string[]>([]);
+  const [mentionIndex, setMentionIndex] = useState(0);
 
   useEffect(() => {
     if (!seed) return;
@@ -129,6 +140,49 @@ export function Composer({
             s.description.toLowerCase().includes(q)
           );
         });
+
+  /**
+   * G43：@ 触发检测 —— `@词` 必须出现在行首或空白之后（`a@b.com` 不弹浮层），
+   * query 是 @ 后面到词尾的一段。与 slash 菜单的同步函数同款取向：只看文本形状，
+   * 不做光标位置检测（打字即提交的场景下，尾部匹配就够准）。
+   */
+  const syncMentionFrom = (value: string) => {
+    const m = /(^|\s)@([^\s]*)$/.exec(value);
+    setMentionQuery(m === null ? null : m[2]);
+    setMentionIndex(0);
+  };
+
+  /** G43：把文本末尾的 `@词` 整体替换成选中路径（尾补空格，方便连着补参数）。 */
+  const applyMention = (path: string) => {
+    const m = /(^|\s)@([^\s]*)$/.exec(text);
+    setMentionQuery(null);
+    if (m === null) return;
+    const head = text.slice(0, text.length - m[0].length);
+    const next = `${head}${m[1]}${path} `;
+    setText(next);
+    const el = inputRef.current;
+    if (el) {
+      el.focus();
+      el.setSelectionRange(next.length, next.length);
+    }
+  };
+
+  // G43：防抖搜索 —— query 变了 180ms 才真发请求（@ 后连续打字不会每键一发）；
+  // loader 每次渲染都是新箭头（App 内联闭包），走 ref 取最新，别进依赖。
+  const filesLoaderRef = useRef(filesLoader);
+  useEffect(() => {
+    filesLoaderRef.current = filesLoader;
+  });
+  useEffect(() => {
+    if (mentionQuery === null || !filesLoader) return;
+    const timer = setTimeout(() => {
+      filesLoaderRef
+        .current?.(mentionQuery)
+        .then((items) => setMentionItems(items))
+        .catch(() => setMentionItems([]));
+    }, 180);
+    return () => clearTimeout(timer);
+  }, [mentionQuery, filesLoader]);
 
   /** 选中即填入与技能面板同一格式的引导语（App 的 `使用「名」技能：`），光标落在句尾。 */
   const applySlash = (name: string) => {
@@ -291,9 +345,22 @@ export function Composer({
 
   const submit = async () => {
     const t = text.trim();
+    // G41：`/技能 参数` 在发送那一刻展开成引导语。菜单态的正则只认无空格的
+    // `/名字`（触发浮层用），带参数的形式只有提交时才见得全 —— 在这一层展开，
+    // 模型看到的就是它已经认识的「使用「名」技能：…」句式。技能表没加载过
+    // （用户从没开过菜单）就原样发送，不猜；名字按展示名或文件夹名匹配，
+    // 与 use_skill 的取名口径一致。
+    let outgoing = t;
+    const cmd = /^\/([^\s]+)\s+(.+)$/.exec(t);
+    if (cmd !== null && slashSkills !== null) {
+      const hit = slashSkills.find(
+        (s) => s.enabled && (s.name === cmd[1] || s.folder === cmd[1]),
+      );
+      if (hit) outgoing = `使用「${hit.name}」技能：${cmd[2]}`;
+    }
     // R216④：「有图无字」必须放行 —— 只贴一张图不打字是日常主用法，
     // 只判 `t === ""` 的可见症状是「贴图点发送没反应」。
-    if ((t === "" && pending.length === 0) || streaming || sendingRef.current) return;
+    if ((outgoing === "" && pending.length === 0) || streaming || sendingRef.current) return;
     sendingRef.current = true;
     setSending(true);
     // Step 2 第 7 条：顺序固定图在前、文本在最后；文本为空时**不产出**空的 text 块
@@ -303,7 +370,7 @@ export function Composer({
     const sent = pendingRef.current;
     const draft = text;
     const blocks: SendBlock[] = sent.map((p) => p.block);
-    if (t !== "") blocks.push({ type: "text", text: t });
+    if (outgoing !== "") blocks.push({ type: "text", text: outgoing });
     sentRef.current = { text: draft, images: sent };
     try {
       await onSend(blocks);
@@ -403,6 +470,35 @@ export function Composer({
               >
                 <span className="slash-name">/{s.name}</span>
                 <span className="slash-desc">{s.description}</span>
+                {/* G41：参数提示跟在描述后（「这条要带参数、参数写什么」），没有就不渲染。 */}
+                {s.argument_hint ? (
+                  <span className="slash-hint">· {s.argument_hint}</span>
+                ) : null}
+              </button>
+            ))}
+          </div>
+        )}
+        {mentionQuery === null || mentionItems.length === 0 ? null : (
+          <div className="mention-menu" role="listbox" aria-label="文件提及菜单">
+            {mentionItems.map((p, i) => (
+              <button
+                type="button"
+                key={p}
+                role="option"
+                aria-selected={i === Math.min(mentionIndex, mentionItems.length - 1)}
+                className={
+                  i === Math.min(mentionIndex, mentionItems.length - 1)
+                    ? "slash-item active"
+                    : "slash-item"
+                }
+                // mousedown 抢在失焦前（同 slash 菜单的取向）；光标落点由 applyMention 安排。
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  applyMention(p);
+                }}
+                onMouseEnter={() => setMentionIndex(i)}
+              >
+                <span className="mention-path">{p}</span>
               </button>
             ))}
           </div>
@@ -419,8 +515,34 @@ export function Composer({
             onChange={(e) => {
               setText(e.target.value);
               syncSlashFrom(e.target.value);
+              syncMentionFrom(e.target.value);
             }}
             onKeyDown={(e) => {
+              // G43：@ 浮层开着时键盘先归浮层 —— ↑↓ 移动、Enter 选中、Esc 关闭。
+              // 与 slash 菜单天然互斥（触发条件不重叠），Enter 的 IME 守卫同款。
+              if (mentionQuery !== null && mentionItems.length > 0) {
+                if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault();
+                  const delta = e.key === "ArrowDown" ? 1 : -1;
+                  setMentionIndex(
+                    (i) => (i + delta + mentionItems.length) % mentionItems.length,
+                  );
+                  return;
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setMentionQuery(null);
+                  return;
+                }
+                if (e.key === "Enter" && !e.shiftKey) {
+                  if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+                  e.preventDefault();
+                  const pick =
+                    mentionItems[Math.min(mentionIndex, mentionItems.length - 1)];
+                  applyMention(pick);
+                  return;
+                }
+              }
               // G33：slash 菜单开着时键盘先归菜单 —— ↑↓ 移动、Enter 选中、Esc 关闭。
               // Enter 与发送共用同一道 IME 守卫：候选框里的回车是选词，不是确认。
               if (slashQuery !== null && slashMatches.length > 0) {
@@ -452,7 +574,10 @@ export function Composer({
               e.preventDefault();
               void submit();
             }}
-            onBlur={() => setSlashQuery(null)}
+            onBlur={() => {
+              setSlashQuery(null);
+              setMentionQuery(null);
+            }}
           />
           {streaming ? (
             <button

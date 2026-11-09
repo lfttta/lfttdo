@@ -293,10 +293,12 @@ impl RuleTable {
     /// 覆盖先写的：先写 deny 再补 allow 就该放行）。没有命中返回 `None`，调用方走默认路径。
     /// 命中判定两条：
     /// · pattern 与规则所属工具**同名**（裸字符串形式解析出来的那条）⇒ 整工具规则，
-    ///   任意调用都命中 —— 非 Exec 工具的 scope 是空串，字面通配永远碰不到它，
+    ///   任意调用都命中 —— 无路径参数的工具的匹配串是空串，字面路径通配碰不到它，
     ///   裸字符串语义（`{"edit_file": "deny"}` 拒掉一切 edit_file）必须靠这条成立；
     /// · 其余按通配匹配 scope（`*` 任意段、`?` 单字符），实现复用 grep 的
     ///   `wildcard_match`（R77：同一个语义不许长出第二份实现）。
+    ///   scope 的取值由 `check` 给：Exec 是命令的每个段（G14/G28），带 `path` 的
+    ///   非 Exec 工具是路径本身（债⑤），其余是空串。
     fn matching_rule(&self, tool: &str, scope: &str) -> Option<ToolRule> {
         let rules = {
             let table = crate::lock::read(&self.tool_rules);
@@ -631,6 +633,39 @@ impl PermissionGate {
             Some(Verdict::Ask) => {}
             None => {}
         }
+        // 债②修复（2026-11-09）：experiment_run 是 Write 档的「变相 run_command」——
+        // 用户为 run_command 写的命令段规则必须同样管住它，否则 `rm *` → deny 在
+        // 实验循环里被原样绕过（deny 规则压过一切的语义不允许这个口子）。命令字段
+        // 同为 `input.command`，切段后按 run_command 的分表判定；无命中再落到下面的
+        // 通用规则路径（experiment_run 自己的表 / G13 裸字符串语义原样保底）。
+        // 规则 **allow** 在这里刻意不收场：Write 档的弹窗照走 —— allow 表达的是
+        // 「这条命令文本可信」，不表达「写文件也不用问」。
+        if call.name == "experiment_run" {
+            let segs = call
+                .input
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .map(split_command_segments)
+                .unwrap_or_default();
+            let segs = if segs.is_empty() {
+                vec![String::new()]
+            } else {
+                segs
+            };
+            if let RuleOutcome::Deny { segment, rule } =
+                self.rules.folded_decision("run_command", &segs)
+            {
+                let reason = if segment.is_empty() {
+                    format!("权限规则拒绝了这次调用（命中规则: {}）", rule.pattern)
+                } else {
+                    format!(
+                        "权限规则拒绝了这次调用（命中规则: {}，段落: {}）",
+                        rule.pattern, segment
+                    )
+                };
+                return Decision::deny(reason);
+            }
+        }
         // G13/G14：工具级权限规则（Settings.permission_rules → RuleTable::tool_rules）。
         // 插在会话级放行 lookup **之前**是刻意的，这层语义必须写明：规则 Deny 必须压过
         // 「本会话都允许」—— 用户在设置里写死 `rm *` → deny，就不该被会话里答过的一次
@@ -660,7 +695,18 @@ impl PermissionGate {
                     segs
                 }
             }
-            _ => vec![String::new()],
+            _ => {
+                // 债⑤修复（2026-11-09）：非 Exec 工具凡带 `path` 参数的，匹配串用
+                // 路径本身 —— 路径型规则（`write_file: [{pattern: "*/.env*",
+                // action: "deny"}]`）原来因为匹配串恒为空串而**永远落空**，deny 写了
+                // 等于没写。没有 path 字段的工具维持空串（裸字符串规则
+                // pattern == 工具名照常命中，G13 语义不动）；`*` 通配对空串与路径
+                // 都命中，已有规则的行为不缩窄。
+                match call.input.get("path").and_then(serde_json::Value::as_str) {
+                    Some(p) if !p.trim().is_empty() => vec![p.trim().to_string()],
+                    _ => vec![String::new()],
+                }
+            }
         };
         // G31：本轮权限模式只改「放行侧」—— server 信任档（上面已收场）与 deny 规则
         // （下面 Deny 臂）在一切模式下都权威；模式只决定 allow/会话/默认路径放不放。
@@ -2124,6 +2170,101 @@ mod tests {
         assert!(
             matches!(&d, Decision::Deny { reason } if reason.contains("权限规则")),
             "整工具 deny 不许因 command 字段缺失而漏成弹窗：{d:?}"
+        );
+    }
+
+    // ---- 债⑤：非 Exec 工具的路径型规则 ----
+
+    /// write_file 的匹配串 = 路径本身：路径型 deny（`*/.env*`）必须拦得住，路径型
+    /// allow 只给该路径（别的路径不沾光）；没有 path 字段的工具维持空串语义
+    /// （裸字符串规则照常命中，`*` 通配照常命中）。
+    #[test]
+    fn a_path_rule_matches_non_exec_tools_by_their_path() {
+        let rules = RuleTable::default();
+        rules
+            .set_tool_rules_from_json(&json!({
+                "write_file": [
+                    {"pattern": "C:/out/*", "action": "allow"},
+                    {"pattern": "*/.env*", "action": "deny"}
+                ]
+            }))
+            .unwrap();
+        assert_eq!(
+            rules.rule_decision("write_file", "C:/out/.env.secret"),
+            Some(RuleAction::Deny),
+            "两条都命中时后写的 deny 覆盖先写的 allow（last-match-wins）"
+        );
+        assert_eq!(
+            rules.rule_decision("write_file", "C:/out/report.md"),
+            Some(RuleAction::Allow),
+            "输出目录内的路径被 allow 规则命中"
+        );
+        assert_eq!(
+            rules.rule_decision("write_file", "D:/elsewhere/x.md"),
+            None,
+            "规则外的路径不命中，落回默认路径"
+        );
+        // 无 path 概念的工具：匹配串是空串，路径 pattern 不许凭空命中；
+        // 裸字符串整工具规则（pattern == 工具名）照常。
+        rules
+            .set_tool_rules_from_json(&json!({
+                "todo_write": [{"pattern": "*/etc/*", "action": "deny"}]
+            }))
+            .unwrap();
+        assert_eq!(
+            rules.rule_decision("todo_write", ""),
+            None,
+            "空串不许被路径 pattern 命中"
+        );
+    }
+
+    // ---- 债②：experiment_run 是 Write 档的「变相 run_command」 ----
+
+    /// run_command 的分段 deny 规则必须同样管住 experiment_run（`rm *` → deny
+    /// 不许在实验循环里被绕过）；命中段的 deny 理由要点名段落。
+    #[tokio::test]
+    async fn experiment_run_hits_run_command_segment_deny() {
+        let gate = PermissionGate::new();
+        gate.set_rules_from_json(&json!({
+            "run_command": [{"pattern": "rm *", "action": "deny"}]
+        }))
+        .unwrap();
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: "experiment_run".into(),
+            risk: Risk::Write,
+            input: json!({"action": "experiment_run", "command": "echo ok && rm -rf /x"}),
+        };
+        let d = gate.check(&c, &CancellationToken::new()).await;
+        assert!(
+            matches!(&d, Decision::Deny { reason }
+                if reason.contains("rm *") && reason.contains("rm -rf /x")),
+            "实验循环里的 rm 段必须被 run_command 的 deny 拦下：{d:?}"
+        );
+    }
+
+    /// 规则 **allow** 刻意不给 experiment_run 免弹窗：allow 表达「命令文本可信」，
+    /// 不表达「写文件也不用问」——Write 档落回既有 Ask 路径（弹窗）。
+    #[tokio::test]
+    async fn a_run_command_allow_does_not_bypass_experiment_run_ask() {
+        let sink = Arc::new(VecSink::default());
+        let gate = PermissionGate::new().with_sink(sink.clone());
+        gate.set_rules_from_json(&json!({
+            "run_command": [{"pattern": "echo *", "action": "allow"}]
+        }))
+        .unwrap();
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: "experiment_run".into(),
+            risk: Risk::Write,
+            input: json!({"action": "experiment_run", "command": "echo hi"}),
+        };
+        // allow 不收场 → Write 档走弹窗：check 挂起等应答。
+        let (h, id) = pending_request(&gate, &c, &CancellationToken::new(), &sink, 1).await;
+        gate.resolve(&id, Decision::deny("测试收尾"));
+        assert!(
+            !h.await.unwrap().allowed(),
+            "allow 规则不许让 experiment_run 跳过弹窗"
         );
     }
 

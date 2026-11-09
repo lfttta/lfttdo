@@ -767,6 +767,58 @@ button.path-chip:disabled {
   font-size: 0.85em;
 }
 
+/* G41 slash 菜单里的参数提示：跟在描述后的小字，只提示「这条要带参数」。 */
+.slash-hint {
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+/* G43 @文件提及浮层：与 slash 菜单同族（正常流 + 同款容器，复用 .slash-item 行样式），
+   只补容器与路径文字 —— 路径很长时截头比截尾有用（盘符/根目录通常一样，文件名在尾巴）。 */
+.mention-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  max-height: 260px;
+  overflow-y: auto;
+  background: var(--bg-raised);
+}
+
+.mention-path {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+
+/* G40 页面回流确认条：模型生成的页面不可信，它请求发送的话先在这里过目。
+   虚线边框区别于正式内容 —— 这是「待决」不是「已发生」。 */
+.followup-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 6px 8px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+
+.followup-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
 /* G39 重试按钮：气泡内正常流的最后一行（不与右上角的复制 chip 抢绝对定位），
    弱化为文本钮 —— 重试是「对这轮答案不满意」的出口，不是主操作。 */
 .bubble-retry {

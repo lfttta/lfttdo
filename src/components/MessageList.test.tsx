@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import { act, render, screen, fireEvent } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { MessageList } from "./MessageList";
 import { readablePreview } from "./MessageBubble";
@@ -127,8 +127,10 @@ describe("MessageList", () => {
     expect(bubble).toHaveAttribute("data-streaming", "true");
   });
 
-  // G32：render_html 工具卡 —— 原始 html 走沙箱 iframe 内嵌渲染，不再以 JSON
+  // G32/G40：render_html 工具卡 —— 原始 html 走沙箱 iframe 内嵌渲染，不再以 JSON
   // 形态倾倒在 <pre> 里；「放大」只是给 iframe 换高度类，不离开聊天流。
+  // G40 把沙箱从「禁脚本」升级为「allow-scripts（仍无同源）」：交互式页面可跑，
+  // 唯一出口是 postMessage 回流（经确认条人审）。
   it("renders the render_html tool card as a sandboxed iframe", () => {
     const s = state({
       turns: [
@@ -154,13 +156,97 @@ describe("MessageList", () => {
     render(<MessageList state={s} onRespond={() => {}} />);
     const frame = screen.getByTitle("卡片");
     expect(frame.tagName).toBe("IFRAME");
-    expect(frame).toHaveAttribute("sandbox", "");
+    // 无 allow-same-origin：页面源是 opaque，读不到父页面；allow-scripts 只开放脚本。
+    expect(frame).toHaveAttribute("sandbox", "allow-scripts");
     expect(frame.getAttribute("src")).toContain(
       encodeURIComponent("<p><b>你好</b></p>"),
     );
     expect(screen.queryByText(/"html"/)).toBeNull();
     fireEvent.click(screen.getByText("放大"));
     expect(frame).toHaveClass("expanded");
+  });
+
+  // G40 回流：页面 postMessage 请求发话 → 先落确认条（人审）→ 点「发送到对话」
+  // 才出卡片。来源校验钉死在本卡片的 iframe，别的 source 冒充无效。
+  it("G40: a page follow-up lands on a confirm strip and only sends after approval", () => {
+    const onFollowUp = vi.fn();
+    const s = state({
+      turns: [
+        {
+          id: 1,
+          role: "assistant",
+          blocks: [
+            {
+              kind: "tool",
+              callId: "c1",
+              name: "render_html",
+              risk: "write",
+              input: { html: "<button onclick='send()'>OK</button>" },
+              status: "ok",
+              preview: "已渲染",
+              images: [],
+              ms: 3,
+            },
+          ],
+        },
+      ],
+    });
+    render(
+      <MessageList state={s} onRespond={() => {}} onFollowUp={onFollowUp} />,
+    );
+    const frame = screen.getByTitle("渲染结果");
+    // 合法来源：本卡片的 contentWindow。消息形状不对（type/prompt 不符）也不收。
+    const legal = new MessageEvent("message", {
+      source: (frame as HTMLIFrameElement).contentWindow,
+      data: { type: "lfttdo:followup", prompt: "  用户选了方案 A  " },
+    });
+    act(() => {
+      window.dispatchEvent(legal);
+    });
+    const strip = screen.getByTestId("followup-strip");
+    expect(strip).toHaveTextContent("页面请求发送：用户选了方案 A");
+    // 流式中禁发：防「页面回流 + 模型还在生成」互相踩。
+    // （确认条本体允许先看到，按钮 disabled 由 streaming prop 驱动。）
+    fireEvent.click(screen.getByTestId("followup-send"));
+    expect(onFollowUp).toHaveBeenCalledTimes(1);
+    expect(onFollowUp).toHaveBeenCalledWith("用户选了方案 A");
+    // 发送后确认条收起。
+    expect(screen.queryByTestId("followup-strip")).toBeNull();
+  });
+
+  // G40：别的窗口/iframe 冒充 source 的消息被忽略 —— 校验不过就不出确认条。
+  it("G40: a follow-up from a foreign source is ignored", () => {
+    const s = state({
+      turns: [
+        {
+          id: 1,
+          role: "assistant",
+          blocks: [
+            {
+              kind: "tool",
+              callId: "c1",
+              name: "render_html",
+              risk: "write",
+              input: { html: "<p>x</p>" },
+              status: "ok",
+              preview: "已渲染",
+              images: [],
+              ms: 3,
+            },
+          ],
+        },
+      ],
+    });
+    render(<MessageList state={s} onRespond={() => {}} />);
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          source: window, // 冒充：父窗口自己，不是卡片的 iframe
+          data: { type: "lfttdo:followup", prompt: "注入的话" },
+        }),
+      );
+    });
+    expect(screen.queryByTestId("followup-strip")).toBeNull();
   });
 
   // 链接点击必须交给外部打开命令，而不是让 WebView 导航走（远程页会替换应用页面）。

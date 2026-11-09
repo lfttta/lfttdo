@@ -102,6 +102,14 @@ export const retryLastSession = (id: string) =>
   invoke<ContentBlock[] | null>("session_retry_last", { id });
 
 /**
+ * G43：@文件提及的浮层数据 —— 在全局 roots + 当前会话输出目录里按文件名/
+ * 相对路径子串找文件，浅层优先、最多 20 条。搜索与剪枝规则在 Rust 侧
+ * （tools/file_search.rs），这里只是入口。
+ */
+export const searchSessionFiles = (sessionId: string, query: string) =>
+  invoke<string[]>("session_search_files", { sessionId, query });
+
+/**
  * `settings_get` 返回**拍平一层**的 `SettingsView`（`ipc.rs:488-500` 的 `#[serde(flatten)]`），
  * 不是 `Settings`。`api_key_masked` 与 `corrupt_backup` 都可以是 `null`（R99 / R102）。
  */

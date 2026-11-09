@@ -262,6 +262,18 @@ async fn run_command(command: &str, base: &Path) -> Result<(bool, String), ToolE
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| ToolError::Failed(format!("命令启动失败: {e}")))?;
+        // 债①修复（2026-11-09）：kill_on_drop 只带走平台 shell 这个直接子进程，
+        // 基准脚本里再派生的孙进程（编译器/测试进程）超时后仍然活着，继续占
+        // 端口与文件。接 mcp::process 的 KillOnCloseJob（shell.rs 的
+        // run_with_job_factory 同一手法）：spawn 后 assign，本函数任何出口
+        // （正常/超时/失败）Drop 都回收整棵树。建/assign 失败按 best-effort
+        // 退回旧行为（kill_on_drop 仍保底直接子进程）—— 回收是加固不是门槛。
+        let job = crate::mcp::process::create_kill_job().ok();
+        if let Some(job) = &job
+            && let Some(pid) = child.id()
+        {
+            let _ = job.assign(pid);
+        }
         let out = child.stdout.take().expect("stdout 已 piped");
         let err = child.stderr.take().expect("stderr 已 piped");
         let merged = Mutex::new(Vec::new());
@@ -274,6 +286,7 @@ async fn run_command(command: &str, base: &Path) -> Result<(bool, String), ToolE
             .await
             .map_err(|e| ToolError::Failed(format!("等待命令退出失败: {e}")))?;
         let text = String::from_utf8_lossy(&merged.into_inner().unwrap()).into_owned();
+        drop(job); // 显式放在 wait 之后：job 的 Drop 即整树回收
         Ok((status.success(), text))
     };
     match tokio::time::timeout(RUN_TIMEOUT, work).await {
