@@ -15,9 +15,16 @@ test('Astryx overlay is a separate edition', () => {
   const overlay = readJson('src-tauri/tauri.astryx.conf.json');
   assert.equal(overlay.productName, 'LFTTDO Astryx');
   assert.equal(overlay.identifier, 'com.qwa.do.astryx');
-  assert.equal(overlay.build.devUrl, 'http://localhost:5173');
+  assert.equal(overlay.build.devUrl, 'http://localhost:1420');
   assert.equal(overlay.build.beforeDevCommand, 'npm run dev:astryx');
   assert.equal(overlay.build.frontendDist, '../astryx-ui/dist');
+});
+
+test('Astryx dev URL passes the Rust navigation whitelist', () => {
+  const overlay = readJson('src-tauri/tauri.astryx.conf.json');
+  const guard = readFileSync('src-tauri/src/web_guard.rs', 'utf8');
+  assert.equal(overlay.build.devUrl, 'http://localhost:1420');
+  assert.match(guard, /Some\(1420\)/, 'web_guard.rs must allow the Astryx dev port');
 });
 
 test('Astryx overlay leaves window creation to Rust', () => {
@@ -29,21 +36,15 @@ test('Astryx overlay leaves window creation to Rust', () => {
   );
 });
 
-test('Astryx overlay grants the window title permission', () => {
+test('Astryx overlay keeps the default security posture', () => {
   const overlay = readJson('src-tauri/tauri.astryx.conf.json');
-  const capabilities = overlay.app?.security?.capabilities ?? [];
-  assert.ok(capabilities.includes('default'), 'missing default capability');
-  const titleCapability = capabilities.find(
-    (capability) => typeof capability === 'object' && capability.identifier === 'astryx-window-title',
-  );
-  assert.ok(titleCapability, 'missing astryx-window-title capability');
-  assert.deepEqual(titleCapability.windows, ['main']);
-  assert.ok(titleCapability.permissions.includes('core:window:allow-set-title'));
+  assert.equal(overlay.app, undefined, 'overlay must not add capabilities or windows');
 });
 
 test('Astryx UI applies the edition window title at runtime', () => {
   const main = readFileSync('astryx-ui/src/main.jsx', 'utf8');
   assert.match(main, /setTitle\('LFTTDO Astryx'\)/);
+  assert.doesNotMatch(main, /setSize\(/);
 });
 
 test('root scripts expose both editions', () => {

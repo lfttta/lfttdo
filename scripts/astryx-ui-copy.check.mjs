@@ -24,8 +24,14 @@ test('astryx-ui is the independent edition package', () => {
   assert.ok(pkg.dependencies['@tauri-apps/api'], 'missing @tauri-apps/api');
 });
 
-test('astryx-ui dev server is fixed to 5173', () => {
+test('prototype-only agent and artifact files are not copied', () => {
+  for (const path of ['.claude', '.mcp.json', 'AGENTS.md', 'ERROR', 'preview.png']) {
+    assert.ok(!existsSync(join(ui, path)), `unexpected ${path}`);
+  }
+});
+
+test('astryx-ui dev server uses the navigation-whitelisted 1420 port', () => {
   const vite = readFileSync(join(ui, 'vite.config.js'), 'utf8');
-  assert.match(vite, /port:\s*5173/);
+  assert.match(vite, /port:\s*1420/);
   assert.match(vite, /strictPort:\s*true/);
 });

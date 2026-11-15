@@ -15,7 +15,7 @@
 - Default edition must stay unchanged: `src-tauri/tauri.conf.json`, `src/`, and all Rust code are read-only in this plan.
 - New edition: `productName = "LFTTDO Astryx"`, `identifier = "com.qwa.do.astryx"`.
 - Default edition remains `npm run tauri dev` on `http://localhost:1420`.
-- New edition uses `npm run tauri:astryx` on `http://localhost:5173`.
+- New edition uses `npm run tauri:astryx` on `http://localhost:1420`. The port is shared because `src-tauri/src/web_guard.rs` allows dev navigation only on 1420; the two editions cannot run `dev` at the same time, but their builds, identifiers and data directories are independent.
 - New edition data directory is `%APPDATA%\com.qwa.do.astryx\`; it must not read or write `%APPDATA%\com.qwa.do\`.
 - Rust builds run from the ASCII worktree `D:\aido\lfttdo-astryx`, never from a path containing Chinese characters.
 - Commit messages and code comments are Chinese. Do not push to `main`.
@@ -28,7 +28,7 @@
 1. **Default edition still loads the original UI after the overlay exists.** Test: `scripts/astryx-edition-config.check.mjs` asserts the base config still points at `../dist` and port 1420; Task 2 also launches it.
 2. **New edition loads the Astryx UI, not a blank/unstyled page.** Test: Task 2's manual launch sends one mock message; Task 3 runs the production build and Astryx doctor.
 3. **Theme assets survive the copy.** Test: `scripts/astryx-ui-copy.check.mjs` asserts `astryx-themes.js`, `themes/lfttdo-noir`, and `src/themes/lfttdo-noir` exist; doctor confirms built styles.
-4. **Port collision between the two editions.** Test: config check asserts 1420 vs 5173 and `strictPort`; manual launch of each edition is separate.
+4. **Shared dev port.** Test: config check asserts both editions use 1420 and `strictPort`; launch them one at a time. The Rust navigation whitelist only allows 1420, so 5173 would render a blank window.
 5. **Data isolation between editions.** Test: Task 2 records `%APPDATA%\com.qwa.do` mtime, launches only the Astryx edition, and asserts the old directory was not touched and the new one was created.
 
 ---
@@ -38,7 +38,7 @@
 ```text
 astryx-ui/                                  copied Astryx prototype (new)
   package.json                              name + @tauri-apps/api
-  vite.config.js                            fixed port 5173
+  vite.config.js                            fixed port 1420
   src/…                                     existing UI source
   astryx-themes.js                          existing generated theme module
   themes/lfttdo-noir/                       existing built theme package
@@ -61,7 +61,7 @@ package.json                                new Astryx scripts only
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: `astryx-ui/` with `npm run dev` on 5173 and `npm run build` producing `astryx-ui/dist/`; package name `lfttdo-astryx-ui`; `@tauri-apps/api` available for Phase 2.
+- Produces: `astryx-ui/` with `npm run dev` on 1420 and `npm run build` producing `astryx-ui/dist/`; package name `lfttdo-astryx-ui`; `@tauri-apps/api` available for Phase 2.
 
 - [ ] **Step 1: Write the failing copy check**
 
@@ -94,9 +94,15 @@ test('astryx-ui is the independent edition package', () => {
   assert.ok(pkg.dependencies['@tauri-apps/api'], 'missing @tauri-apps/api');
 });
 
-test('astryx-ui dev server is fixed to 5173', () => {
+test('prototype-only agent and artifact files are not copied', () => {
+  for (const path of ['.claude', '.mcp.json', 'AGENTS.md', 'ERROR', 'preview.png']) {
+    assert.ok(!existsSync(join(ui, path)), `unexpected ${path}`);
+  }
+});
+
+test('astryx-ui dev server is fixed to 1420', () => {
   const vite = readFileSync(join(ui, 'vite.config.js'), 'utf8');
-  assert.match(vite, /port:\s*5173/);
+  assert.match(vite, /port:\s*1420/);
   assert.match(vite, /strictPort:\s*true/);
 });
 ```
@@ -112,7 +118,7 @@ Expected: FAIL with `ENOENT` for `astryx-ui/package.json` (or `missing index.htm
 Run from `D:\aido\lfttdo-astryx` in PowerShell:
 
 ```powershell
-robocopy "D:\aido\Astryx-界面制作\Astryx测试1" "D:\aido\lfttdo-astryx\astryx-ui" /E /XD node_modules dist artifacts .zcode /XF 使用说明.md
+robocopy "D:\aido\Astryx-界面制作\Astryx测试1" "D:\aido\lfttdo-astryx\astryx-ui" /E /XD node_modules dist artifacts .zcode .claude /XF 使用说明.md AGENTS.md ERROR preview.png .mcp.json
 if ($LASTEXITCODE -ge 8) { throw "robocopy failed: $LASTEXITCODE" }
 ```
 
@@ -128,7 +134,7 @@ In `astryx-ui/package.json`, change `"name"` to `"lfttdo-astryx-ui"` and add to 
 
 Do not change React, Vite, Astryx, or Heroicons versions.
 
-- [ ] **Step 5: Pin the Vite dev server to 5173**
+- [ ] **Step 5: Pin the Vite dev server to 1420**
 
 Replace the `defineConfig` body in `astryx-ui/vite.config.js` with:
 
@@ -136,7 +142,7 @@ Replace the `defineConfig` body in `astryx-ui/vite.config.js` with:
 export default defineConfig({
   plugins: [react()],
   server: {
-    port: 5173,
+    port: 1420,
     strictPort: true,
   },
 });
@@ -156,7 +162,7 @@ Expected: both paths are ignored. If either is not ignored, add `astryx-ui/node_
 
 Run: `node --test scripts/astryx-ui-copy.check.mjs`
 
-Expected: `# pass 3`, `# fail 0`.
+Expected: `# pass 4`, `# fail 0`.
 
 - [ ] **Step 8: Install and build the copied UI**
 
@@ -218,9 +224,36 @@ test('Astryx overlay is a separate edition', () => {
   const overlay = readJson('src-tauri/tauri.astryx.conf.json');
   assert.equal(overlay.productName, 'LFTTDO Astryx');
   assert.equal(overlay.identifier, 'com.qwa.do.astryx');
-  assert.equal(overlay.build.devUrl, 'http://localhost:5173');
+  assert.equal(overlay.build.devUrl, 'http://localhost:1420');
   assert.equal(overlay.build.beforeDevCommand, 'npm run dev:astryx');
   assert.equal(overlay.build.frontendDist, '../astryx-ui/dist');
+});
+
+test('Astryx dev URL passes the Rust navigation whitelist', () => {
+  const overlay = readJson('src-tauri/tauri.astryx.conf.json');
+  const guard = readFileSync('src-tauri/src/web_guard.rs', 'utf8');
+  assert.equal(overlay.build.devUrl, 'http://localhost:1420');
+  assert.match(guard, /Some\(1420\)/, 'web_guard.rs must allow the Astryx dev port');
+});
+
+test('Astryx overlay leaves window creation to Rust', () => {
+  const overlay = readJson('src-tauri/tauri.astryx.conf.json');
+  assert.equal(
+    (overlay.app?.windows ?? []).length,
+    0,
+    'overlay must not create windows: src-tauri/src/ipc.rs creates label "main" in setup',
+  );
+});
+
+test('Astryx overlay keeps the default security posture', () => {
+  const overlay = readJson('src-tauri/tauri.astryx.conf.json');
+  assert.equal(overlay.app, undefined, 'overlay must not add capabilities or windows');
+});
+
+test('Astryx UI applies the edition window title at runtime', () => {
+  const main = readFileSync('astryx-ui/src/main.jsx', 'utf8');
+  assert.match(main, /setTitle\('LFTTDO Astryx'\)/);
+  assert.doesNotMatch(main, /setSize\(/);
 });
 
 test('root scripts expose both editions', () => {
@@ -259,17 +292,18 @@ Create `src-tauri/tauri.astryx.conf.json`:
   "identifier": "com.qwa.do.astryx",
   "build": {
     "beforeDevCommand": "npm run dev:astryx",
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build:astryx",
     "frontendDist": "../astryx-ui/dist"
-  },
-  "app": {
-    "windows": [
-      { "title": "LFTTDO Astryx" }
-    ]
   }
 }
 ```
+
+Do not add `app.windows` or inline `app.security.capabilities` to the overlay:
+
+- `src-tauri/src/ipc.rs` creates the only window (`label = "main"`, title `LFTTDO`, 800×600) in `setup`; adding `app.windows` would create a second window.
+- Inline capability objects in `app.security.capabilities` are not emitted into the generated ACL; the title change must rely on the existing `core:default` capability. Do not grant window-size permissions just to resize the app.
+- `astryx-ui/src/main.jsx` changes the title at runtime with `getCurrentWindow().setTitle('LFTTDO Astryx')`. Window size stays 800×600; the user can maximize.
 
 Do not edit `src-tauri/tauri.conf.json`.
 
@@ -301,7 +335,7 @@ Expected: `@tauri-apps/cli`, `vitest`, and the existing frontend dependencies ar
 
 Run: `node --test scripts/astryx-edition-config.check.mjs`
 
-Expected: `# pass 3`, `# fail 0`.
+Expected: `# pass 7`, `# fail 0`.
 
 - [ ] **Step 7: Verify the Tauri CLI accepts the overlay**
 

@@ -4,21 +4,8 @@
   "identifier": "com.qwa.do.astryx",
   "build": {
     "beforeDevCommand": "npm run dev:astryx",
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build:astryx",
     "frontendDist": "../astryx-ui/dist"
-  },
-  "app": {
-    "security": {
-      "capabilities": [
-        "default",
-        {
-          "identifier": "astryx-window-title",
-          "description": "允许 Astryx 前端把主窗口标题改为 LFTTDO Astryx（Rust 主窗口标题硬编码为 LFTTDO）",
-          "windows": ["main"],
-          "permissions": ["core:window:allow-set-title"]
-        }
-      ]
-    }
   }
 }

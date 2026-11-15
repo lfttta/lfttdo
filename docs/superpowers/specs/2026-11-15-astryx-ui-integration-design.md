@@ -122,19 +122,18 @@ astryx-ui/
   "identifier": "com.qwa.do.astryx",
   "build": {
     "beforeDevCommand": "npm run dev:astryx",
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build:astryx",
     "frontendDist": "../astryx-ui/dist"
-  },
-  "app": {
-    "windows": [
-      { "title": "LFTTDO Astryx" }
-    ]
   }
 }
 ```
 
-Tauri 默认读取 `tauri.conf.json`；`--config` 把 overlay 合并进来。P1 先实测合并结果（尤其是 `build` 与 `app.windows`）；若 CLI 不接受该参数顺序，改成 `tauri --config src-tauri/tauri.astryx.conf.json dev`。
+Overlay **不写 `app.windows`**：`src-tauri/src/ipc.rs` 的 `setup` 已经创建唯一的 `main` 窗口（标题硬编码 `LFTTDO`，800×600）。再在配置里声明窗口会多出一个窗口，而不是改标题。独立版的标题由前端启动时调用 `getCurrentWindow().setTitle('LFTTDO Astryx')` 修改；`set-title` 属于 `core:default`，无需额外权限。窗口尺寸保留 Rust 的 800×600，可最大化；不要在前端调用 `setSize`。
+
+Overlay 同样**不写内联 `app.security.capabilities`**：实测内联 capability 没有进入生成的 ACL（`src-tauri/gen` 中找不到对应标识），依赖它的 `set-size` 会失败。需要新权限时，应走独立的 capability 文件并在 P2 真机验证，而不是塞进 overlay。
+
+Tauri 默认读取 `tauri.conf.json`；`--config` 把 overlay 合并进来。P1 已实测合并结果：`build` 覆盖生效，Rust 仍只创建一个 `main` 窗口。
 
 根 `package.json` 增加：
 
@@ -143,7 +142,7 @@ Tauri 默认读取 `tauri.conf.json`；`--config` 把 overlay 合并进来。P1 
   "scripts": {
     "dev:astryx": "npm --prefix astryx-ui run dev",
     "build:astryx": "npm --prefix astryx-ui run build",
-    "test:astryx": "npm --prefix astryx-ui run test",
+    "test:edition": "node --test scripts/astryx-ui-copy.check.mjs scripts/astryx-edition-config.check.mjs",
     "tauri:astryx": "tauri dev --config src-tauri/tauri.astryx.conf.json",
     "tauri:astryx:build": "tauri build --config src-tauri/tauri.astryx.conf.json"
   }
@@ -153,12 +152,12 @@ Tauri 默认读取 `tauri.conf.json`；`--config` 把 overlay 合并进来。P1 
 启动方式：
 
 - 默认 LFTTDO：`npm run tauri dev`（原样，1420 端口）。
-- LFTTDO Astryx：`npm run tauri:astryx`（5173 端口，加载 `astryx-ui`）。
+- LFTTDO Astryx：`npm run tauri:astryx`（1420 端口，加载 `astryx-ui`）。
 - 构建 Astryx 版：`npm run tauri:astryx:build`。
 
 `identifier` 用 `com.qwa.do.astryx`，因此 Astryx 版有独立数据目录 `%APPDATA%\com.qwa.do.astryx\`，不会读写默认版本的会话库。若希望两版共享数据，可把 identifier 改回 `com.qwa.do`；但这样两个安装器不能安全并存，只适合作为“替换版”。默认选独立数据，避免两个版本同时跑时争用同一个 SQLite。P5 可选做一次“从 `com.qwa.do` 复制数据”的迁移入口。
 
-`astryx-ui/vite.config.js` 使用 `server.port = 5173`、`strictPort = true`，避免 Tauri 等到错误端口。旧 `src/` 的 Vite 仍保留 1420，两版可以同时开发。
+`astryx-ui/vite.config.js` 使用 `server.port = 1420`、`strictPort = true`。这里不能换成 5173：Rust 的 `src-tauri/src/web_guard.rs` 只允许 1420 的开发服务器做顶层导航，5173 会被拒绝并留下空白窗口。两版因此共用 dev 端口，一次只能跑一个；构建产物、产品标识和数据目录仍然独立。
 
 ### 6.3 依赖
 
@@ -498,6 +497,8 @@ cargo fmt --check
 | Tauri 配置改动影响旧版本 | 默认 `tauri.conf.json` 不改；Astryx 用独立 overlay；旧版启动脚本原样 |
 | 独立版本与默认版本数据互相污染 | 默认独立 identifier `com.qwa.do.astryx`，各自数据目录；共享数据作为显式选项，不默认开 |
 | 两个安装器并存冲突 | P5 实测独立 productName / identifier / 安装目录；必要时设置独立 `mainBinaryName` |
+| overlay 重复声明窗口导致两个窗口 | overlay 不写 `app.windows`；窗口只由 `ipc.rs` 的 `setup` 创建，前端用 `setTitle` 改标题 |
+| overlay 内联 capability 不生效 | overlay 不写 `app.security.capabilities`；不申请 `set-size`，窗口保持 800×600 可最大化 |
 | 设置只提交局部字段导致丢配置 | 保留 `settings_get` 原始对象，展开后提交完整 Settings；加 round-trip 测试 |
 | `turn_start` 多次导致多助手气泡 | 按 LFTTDO 语义处理；不要假设单气泡；重试/停止以最后一轮为准 |
 | 非 active 会话事件丢失 | 按 `payload.sessionId` 分发到所有会话；未知会话刷新列表 |

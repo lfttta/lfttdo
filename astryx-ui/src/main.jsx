@@ -15,6 +15,7 @@ import App from './App';
 
 // Rust 主窗口把标题硬编码为 LFTTDO，独立版本在 Tauri 内运行时改成 LFTTDO Astryx。
 // 浏览器里直接跑 `npm run dev` 时没有 __TAURI_INTERNALS__，跳过。
+// 窗口尺寸沿用 Rust 的 800×600，用户可最大化；这里不申请额外的窗口尺寸权限。
 if ('__TAURI_INTERNALS__' in window) {
   getCurrentWindow().setTitle('LFTTDO Astryx').catch(() => {});
 }
