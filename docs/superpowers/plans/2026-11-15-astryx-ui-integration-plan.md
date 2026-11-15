@@ -19,7 +19,7 @@
 - New edition data directory is `%APPDATA%\com.qwa.do.astryx\`; it must not read or write `%APPDATA%\com.qwa.do\`.
 - Rust builds run from the ASCII worktree `D:\aido\lfttdo-astryx`, never from a path containing Chinese characters.
 - Commit messages and code comments are Chinese. Do not push to `main`.
-- Astryx UI rules: no raw `<div>`/`<span>` layout, no bare hex/px, use Astryx components and tokens. Run `npx astryx doctor --built astryx-ui/dist`.
+- Astryx UI rules: no raw `<div>`/`<span>` layout, no bare hex/px, use Astryx components and tokens. Run `cd astryx-ui && npx astryx doctor --built dist`.
 - New dependencies are allowed only inside `astryx-ui/`; the old root frontend keeps its dependency set.
 - This plan is Phase 1 only. Do not implement P2–P5 here.
 
@@ -171,7 +171,7 @@ Expected: `vite v8.x building for production...` then `✓ built in …`; `astry
 
 - [ ] **Step 9: Run the Astryx gate**
 
-Run: `npx astryx doctor --built astryx-ui/dist`
+Run: `cd astryx-ui && npx astryx doctor --built dist`
 
 Expected: `fail: 0`. Warnings about external fonts or the local CLI path are acceptable.
 
@@ -287,13 +287,23 @@ In root `package.json`, add:
 
 Keep all existing scripts unchanged.
 
-- [ ] **Step 5: Run the config check to verify it passes**
+- [ ] **Step 5: Install root dependencies**
+
+Run from the repository root:
+
+```bash
+npm install --no-audit --no-fund
+```
+
+Expected: `@tauri-apps/cli`, `vitest`, and the existing frontend dependencies are installed. This step is local-only; do not commit `node_modules/`. If `package-lock.json` changes, inspect why before committing; the old frontend dependency set must stay unchanged.
+
+- [ ] **Step 6: Run the config check to verify it passes**
 
 Run: `node --test scripts/astryx-edition-config.check.mjs`
 
 Expected: `# pass 3`, `# fail 0`.
 
-- [ ] **Step 6: Verify the Tauri CLI accepts the overlay**
+- [ ] **Step 7: Verify the Tauri CLI accepts the overlay**
 
 Run:
 
@@ -303,7 +313,7 @@ npm run tauri:astryx -- --help
 
 Expected: Tauri CLI help prints without a config parse error. If `--config` is rejected in this position, change the two scripts to `tauri --config src-tauri/tauri.astryx.conf.json dev` / `... build`, update the config check, and rerun.
 
-- [ ] **Step 7: Record the default data directory state**
+- [ ] **Step 8: Record the default data directory state**
 
 In PowerShell:
 
@@ -314,7 +324,7 @@ if (Test-Path $old) { (Get-Item $old).LastWriteTimeUtc } else { "missing" }
 
 Record the output in the task handoff. Do not modify `%APPDATA%\com.qwa.do`.
 
-- [ ] **Step 8: Launch the Astryx edition and verify the window**
+- [ ] **Step 9: Launch the Astryx edition and verify the window**
 
 Run: `npm run tauri:astryx`
 
@@ -334,13 +344,13 @@ Test-Path "$env:APPDATA\com.qwa.do.astryx"
 
 Expected: `True`; the old directory's timestamp equals the recorded value. If the new directory was not created, inspect the Tauri log and report it; do not fake the check.
 
-- [ ] **Step 9: Launch the default edition and verify it is unchanged**
+- [ ] **Step 10: Launch the default edition and verify it is unchanged**
 
 Run: `npm run tauri dev`
 
 Expected: the original LFTTDO UI loads on port 1420, with its original title and look. Close it.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add package.json src-tauri/tauri.astryx.conf.json scripts/astryx-edition-config.check.mjs
@@ -371,7 +381,7 @@ Run:
 
 ```bash
 npm --prefix astryx-ui run build
-npx astryx doctor --built astryx-ui/dist
+(cd astryx-ui && npx astryx doctor --built dist)
 ```
 
 Expected: build succeeds; doctor reports `fail: 0`.

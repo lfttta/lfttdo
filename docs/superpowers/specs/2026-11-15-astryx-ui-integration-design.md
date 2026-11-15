@@ -458,7 +458,7 @@ Tauri 默认读取 `tauri.conf.json`；`--config` 把 overlay 合并进来。P1 
 - 适配器单测：用 fake `invoke` / `listen`，验证命令参数逐字正确（camelCase 键名）。
 - 构建检查：
   - `npm --prefix astryx-ui run build`
-  - `npx astryx doctor --built astryx-ui/dist`
+  - `cd astryx-ui && npx astryx doctor --built dist`
 
 ### 14.2 回归
 
