@@ -1,0 +1,50 @@
+{
+  "name": "lfttdo-noir",
+  "like": "neutral",
+  "mode": "dark-only",
+  "settings": [
+    {
+      "thing": "corners",
+      "value": "large",
+      "source": "dial"
+    },
+    {
+      "thing": "spacing",
+      "value": "roomy",
+      "source": "dial"
+    },
+    {
+      "thing": "accent",
+      "value": "#7c8cff",
+      "source": "dial"
+    },
+    {
+      "thing": "neutral",
+      "value": "#7b849c",
+      "source": "dial"
+    },
+    {
+      "thing": "vibrancy",
+      "value": "65",
+      "source": "dial"
+    },
+    {
+      "thing": "surfaces",
+      "value": "glass",
+      "source": "dial"
+    },
+    {
+      "thing": "--color-background-body",
+      "value": "#0a0d1c",
+      "source": "token"
+    },
+    {
+      "thing": "background",
+      "value": "radial-gradient(circle at 12% 0%, rgb(79 70 229 / 0.32), transparent 42%), radial-gradient(circle at 92% 8%, rgb(6 182 212 / 0.2), transparent 38%), var(--color-background-body)",
+      "source": "property",
+      "on": "app-shell"
+    }
+  ],
+  "palette": "a3fd59bd777fda34c068b128f32bcf811885637664a1f3a97b64b4a7d33951d0",
+  "lifted": []
+}

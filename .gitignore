@@ -1,5 +1,7 @@
 /node_modules
 /dist
+/astryx-ui/node_modules/
+/astryx-ui/dist/
 /src-tauri/target
 /src-tauri/gen/schemas
 *.db
