@@ -9,7 +9,12 @@
     "preview": "vite preview",
     "test": "vitest run",
     "lint:css": "stylelint \"src/**/*.css\" \"!src/theme/tokens.css\" \"!src/theme/presets.css\"",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "dev:astryx": "npm --prefix astryx-ui run dev",
+    "build:astryx": "npm --prefix astryx-ui run build",
+    "test:edition": "node --test scripts/astryx-ui-copy.check.mjs scripts/astryx-edition-config.check.mjs",
+    "tauri:astryx": "tauri dev --config src-tauri/tauri.astryx.conf.json",
+    "tauri:astryx:build": "tauri build --config src-tauri/tauri.astryx.conf.json"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

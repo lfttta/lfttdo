@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "LFTTDO Astryx",
+  "identifier": "com.qwa.do.astryx",
+  "build": {
+    "beforeDevCommand": "npm run dev:astryx",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build:astryx",
+    "frontendDist": "../astryx-ui/dist"
+  },
+  "app": {
+    "windows": [
+      { "title": "LFTTDO Astryx" }
+    ]
+  }
+}
