@@ -9,8 +9,16 @@
     "frontendDist": "../astryx-ui/dist"
   },
   "app": {
-    "windows": [
-      { "title": "LFTTDO Astryx" }
-    ]
+    "security": {
+      "capabilities": [
+        "default",
+        {
+          "identifier": "astryx-window-title",
+          "description": "允许 Astryx 前端把主窗口标题改为 LFTTDO Astryx（Rust 主窗口标题硬编码为 LFTTDO）",
+          "windows": ["main"],
+          "permissions": ["core:window:allow-set-title"]
+        }
+      ]
+    }
   }
 }
