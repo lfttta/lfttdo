@@ -1,8 +1,9 @@
-# Astryx UI 接入 LFTTDO 设计
+# Astryx UI 独立版本接入 LFTTDO 设计
 
 - 日期：2026-11-15
 - 分支：`feat/astryx-ui`
 - 基线：`f412d7e`（`main`）
+- 版本形态：独立应用 **LFTTDO Astryx**，默认 LFTTDO 保持原样
 - 状态：方案待评审（本分支先提交设计与实施计划，不改 Rust、不改现有 `src/`）
 - Astryx 原型：`D:\aido\Astryx-界面制作\Astryx测试1`
 
@@ -10,23 +11,26 @@
 
 `Astryx测试1` 已经有一套可运行的高保真 Agent 界面：深色玻璃主题、会话侧栏、消息流、工具卡、权限卡、模型提问弹窗、输入坞、设置/技能/MCP/Hooks 面板。它目前由 `src/hooks/useMockAgent.js` 的定时器脚本驱动，**没有真实模型、工具、文件、MCP 与会话持久化**。
 
-LFTTDO 是完整的 Tauri v2 + React + Rust 桌面 Agent：真实模型流、内置工具、权限门、MCP、SQLite 会话、长期记忆、Hooks 都已经实现。本方案要做的不是重写 Agent，而是**让 Astryx 界面成为 LFTTDO 的另一套前端**，直接复用 LFTTDO 的 Rust 内核和全部 IPC 能力。
+LFTTDO 是完整的 Tauri v2 + React + Rust 桌面 Agent：真实模型流、内置工具、权限门、MCP、SQLite 会话、长期记忆、Hooks 都已经实现。本方案要做的不是重写 Agent，而是**基于同一套 Rust 内核做一个独立版本 `LFTTDO Astryx`**：默认 LFTTDO 保持原 UI，Astryx 版使用同一份 Rust 代码和 IPC 能力，两个版本可以分别构建、分别运行。
 
 ## 2. 目标与非目标
 
 ### 目标
 
-1. Astryx 界面运行在 LFTTDO 的 Tauri 窗口里，使用真实模型与工具。
-2. 复用 LFTTDO 现有 Tauri 命令与 `agent` 事件通道，**不改 Rust Agent 核心**。
-3. 保留现有 `src/` 前端与 354 条前端测试；分支可随时回退。
-4. 先打通：文本流、工具卡、权限卡、模型提问、停止、重试、真实会话。
-5. 再补齐：设置、图片、工作文件夹、导出、技能/MCP/Hooks、长期记忆。
+1. 产出独立应用 `LFTTDO Astryx`，运行在 Tauri 窗口里，使用真实模型与工具。
+2. 默认 LFTTDO（`npm run tauri dev`）保持原 UI 不变；Astryx 版用独立配置与启动脚本。
+3. 复用 LFTTDO 现有 Tauri 命令与 `agent` 事件通道，**不改 Rust Agent 核心**。
+4. 保留现有 `src/` 前端与 354 条前端测试；分支可随时回退。
+5. 先打通：文本流、工具卡、权限卡、模型提问、停止、重试、真实会话。
+6. 再补齐：设置、图片、工作文件夹、导出、技能/MCP/Hooks、长期记忆。
 
 ### 非目标
 
 - 不把 Rust Agent 改写成 HTTP/SSE 服务。
 - 不把 `--headless` 当正式后端（它没有权限弹窗、没有 MCP、提问无人应答）。
 - 不替换或删除现有 `src/` 前端；不做 `main` 分支合并。
+- 不修改默认 `src-tauri/tauri.conf.json`；Astryx 版用独立 overlay 配置。
+- 不把 Astryx 版强行设为默认应用；两个版本各自有启动脚本。
 - 不在本分支改 `src-tauri/` 的 Rust 逻辑；发现 IPC 缺口先停下补设计。
 
 ## 3. 现状与约束
@@ -62,7 +66,7 @@ LFTTDO 是完整的 Tauri v2 + React + Rust 桌面 Agent：真实模型流、内
 
 | 方案 | 做法 | 结论 |
 |---|---|---|
-| A. Astryx 作为 LFTTDO 的替代前端 | 新目录 `astryx-ui/`，Tauri 配置指向它；Rust 不动 | **选定** |
+| A. Astryx 独立版本 | 新目录 `astryx-ui/` + 独立 Tauri overlay 配置；默认 LFTTDO 不动，Rust 不动 | **选定** |
 | B. 直接替换 `src/` | 分支里删除旧前端 | 否决：会毁掉 354 条现有测试与旧 UI 对照 |
 | C. 新增 Rust HTTP/SSE 服务 | 把 `AgentSession` 包成 Web 服务 | 否决：重复 IPC 装配，权限/取消/提问都要重做 |
 | D. 包一层 `--headless` | 每次消息启动 `lfttdo --headless`，解析 NDJSON | 否决：Write/Exec 被拒、无 MCP、提问无人应答，只能做只读演示 |
@@ -72,19 +76,16 @@ LFTTDO 是完整的 Tauri v2 + React + Rust 桌面 Agent：真实模型流、内
 ## 5. 选定架构
 
 ```text
-LFTTDO Tauri 窗口
-├─ astryx-ui/                 React 19 + Astryx（本方案新增）
-│  ├─ src/App.jsx             现有界面，接线改为 useAgent
-│  ├─ src/hooks/useAgent.js   根据 isTauri() 选 mock / 真实适配器
-│  ├─ src/agent/lfttdo/
-│  │  ├─ client.js            invoke / listen / 命令封装
-│  │  └─ projection.js        AgentEvent -> 现有 Block[] / Message[]
-│  └─ vite.config.js          dev server 5173，strictPort
-└─ src-tauri/                 Rust 内核（不改）
-   ├─ ipc.rs                  send_message / interrupt / respond / question_respond ...
-   ├─ agent/                  AgentSession、事件、权限、上下文
-   └─ store/                  SQLite 会话真相
+LFTTDO 默认版本                         LFTTDO Astryx（本方案新增）
+├─ src/ 原前端                          ├─ astryx-ui/ React 19 + Astryx
+├─ src-tauri/tauri.conf.json           ├─ src-tauri/tauri.astryx.conf.json（overlay）
+└─ npm run tauri dev                   └─ npm run tauri:astryx
+        │                                        │
+        └──────────── 共享 src-tauri/ Rust 内核 ──┘
+                       ipc.rs / agent/ / store/
 ```
+
+`LFTTDO Astryx` 是独立版本：独立产品名、独立 bundle 标识、独立启动/构建脚本；默认 LFTTDO 的 Tauri 配置和启动方式一个字都不改。
 
 关键原则：
 
@@ -111,20 +112,29 @@ astryx-ui/
 
 从 `Astryx测试1` 复制时排除：`node_modules/`、`dist/`、`artifacts/`、`.zcode/`、本地使用说明。
 
-### 6.2 Tauri 配置
+### 6.2 两个 Tauri 配置
 
-`src-tauri/tauri.conf.json` 在分支上改为：
+默认 `src-tauri/tauri.conf.json` **不改**。新增 `src-tauri/tauri.astryx.conf.json` 作为 overlay：
 
 ```json
 {
+  "productName": "LFTTDO Astryx",
+  "identifier": "com.qwa.do.astryx",
   "build": {
     "beforeDevCommand": "npm run dev:astryx",
     "devUrl": "http://localhost:5173",
     "beforeBuildCommand": "npm run build:astryx",
     "frontendDist": "../astryx-ui/dist"
+  },
+  "app": {
+    "windows": [
+      { "title": "LFTTDO Astryx" }
+    ]
   }
 }
 ```
+
+Tauri 默认读取 `tauri.conf.json`；`--config` 把 overlay 合并进来。P1 先实测合并结果（尤其是 `build` 与 `app.windows`）；若 CLI 不接受该参数顺序，改成 `tauri --config src-tauri/tauri.astryx.conf.json dev`。
 
 根 `package.json` 增加：
 
@@ -133,12 +143,22 @@ astryx-ui/
   "scripts": {
     "dev:astryx": "npm --prefix astryx-ui run dev",
     "build:astryx": "npm --prefix astryx-ui run build",
-    "test:astryx": "npm --prefix astryx-ui run test"
+    "test:astryx": "npm --prefix astryx-ui run test",
+    "tauri:astryx": "tauri dev --config src-tauri/tauri.astryx.conf.json",
+    "tauri:astryx:build": "tauri build --config src-tauri/tauri.astryx.conf.json"
   }
 }
 ```
 
-`astryx-ui/vite.config.js` 使用 `server.port = 5173`、`strictPort = true`，避免 Tauri 等到错误端口。旧 `src/` 的 Vite 仍保留 1420，但 Tauri 不再启动它。
+启动方式：
+
+- 默认 LFTTDO：`npm run tauri dev`（原样，1420 端口）。
+- LFTTDO Astryx：`npm run tauri:astryx`（5173 端口，加载 `astryx-ui`）。
+- 构建 Astryx 版：`npm run tauri:astryx:build`。
+
+`identifier` 用 `com.qwa.do.astryx`，因此 Astryx 版有独立数据目录 `%APPDATA%\com.qwa.do.astryx\`，不会读写默认版本的会话库。若希望两版共享数据，可把 identifier 改回 `com.qwa.do`；但这样两个安装器不能安全并存，只适合作为“替换版”。默认选独立数据，避免两个版本同时跑时争用同一个 SQLite。P5 可选做一次“从 `com.qwa.do` 复制数据”的迁移入口。
+
+`astryx-ui/vite.config.js` 使用 `server.port = 5173`、`strictPort = true`，避免 Tauri 等到错误端口。旧 `src/` 的 Vite 仍保留 1420，两版可以同时开发。
 
 ### 6.3 依赖
 
@@ -389,13 +409,13 @@ astryx-ui/
 - 新增本设计文档与实施计划。
 - 不改代码，不推送 main。
 
-### Phase 1：脚手架与 Tauri 外壳
+### Phase 1：脚手架与独立 Tauri 版本
 
 - 复制 `Astryx测试1` 到 `astryx-ui/`（排除构建产物）。
-- 增加根 scripts 与 Tauri 配置。
+- 增加根 scripts 与 `src-tauri/tauri.astryx.conf.json` overlay。
 - `npm install`、`npm run build:astryx` 通过。
-- `npm run tauri dev` 打开 Astryx UI；此时仍走 mock。
-- 旧 `src/` 不修改；旧测试仍通过。
+- `npm run tauri:astryx` 打开 LFTTDO Astryx；此时仍走 mock。
+- 默认 `npm run tauri dev` 仍打开原 LFTTDO；旧 `src/` 与旧测试不变。
 
 ### Phase 2：真实文本与会话
 
@@ -457,7 +477,7 @@ cargo fmt --check
 
 ### 14.3 真机验收
 
-在 Tauri 窗口里用真实模型端点（默认本机 Ollama `/v1`）逐项操作：
+在 `LFTTDO Astryx` 窗口里用真实模型端点（默认本机 Ollama `/v1`）逐项操作：
 
 1. 发送一句话，看到流式文本。
 2. 触发 `read_file`，工具卡 running → complete。
@@ -475,7 +495,9 @@ cargo fmt --check
 | 风险 | 处理 |
 |---|---|
 | 非 ASCII 仓库路径导致 Rust 构建失败 | 使用 ASCII worktree `D:\aido\lfttdo-astryx`；必要时 `AWS_LC_SYS_PREBUILT_NASM=1` |
-| Tauri 配置改动影响旧前端开发 | 只在分支改；旧 `src/` 保留；回退配置即可恢复 |
+| Tauri 配置改动影响旧版本 | 默认 `tauri.conf.json` 不改；Astryx 用独立 overlay；旧版启动脚本原样 |
+| 独立版本与默认版本数据互相污染 | 默认独立 identifier `com.qwa.do.astryx`，各自数据目录；共享数据作为显式选项，不默认开 |
+| 两个安装器并存冲突 | P5 实测独立 productName / identifier / 安装目录；必要时设置独立 `mainBinaryName` |
 | 设置只提交局部字段导致丢配置 | 保留 `settings_get` 原始对象，展开后提交完整 Settings；加 round-trip 测试 |
 | `turn_start` 多次导致多助手气泡 | 按 LFTTDO 语义处理；不要假设单气泡；重试/停止以最后一轮为准 |
 | 非 active 会话事件丢失 | 按 `payload.sessionId` 分发到所有会话；未知会话刷新列表 |
@@ -490,4 +512,5 @@ cargo fmt --check
 
 1. 验收用的模型端点：本机 Ollama `http://127.0.0.1:11434/v1`，还是指定端点？
 2. Phase 4 是否必须一次做完全部面板，还是先设置 + 图片 + 工作区，技能/MCP/Hooks/记忆随后？
-3. 旧 UI 是否需要保留一个可运行入口（例如 `tauri.legacy.conf.json`），还是分支只保证可回退？
+3. LFTTDO Astryx 用独立数据目录 `com.qwa.do.astryx`（默认，推荐），还是共享 `com.qwa.do` 的现有会话？共享意味着两个版本不能安全并存/同时运行。
+4. 独立版本的产品名用 `LFTTDO Astryx`，还是你有别的命名？

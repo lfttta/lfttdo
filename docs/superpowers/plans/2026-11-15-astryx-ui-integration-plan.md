@@ -1,8 +1,9 @@
-# Astryx UI 接入 LFTTDO 实施计划
+# LFTTDO Astryx 独立版本实施计划
 
 - 日期：2026-11-15
 - 分支：`feat/astryx-ui`
 - 基线：`f412d7e`
+- 版本形态：独立应用 `LFTTDO Astryx`，默认 LFTTDO 保持原样
 - 设计文档：`docs/superpowers/specs/2026-11-15-astryx-ui-integration-design.md`
 - 实施 worktree：`D:\aido\lfttdo-astryx`（ASCII 路径，避免 Rust NASM 构建受中文路径影响）
 
@@ -17,7 +18,7 @@
 
 按“先能跑、再能聊、再接工具、最后接面板”的顺序做，每一步都能单独验收：
 
-1. **P1 外壳**：Tauri 窗口加载 Astryx UI，仍走 mock。
+1. **P1 外壳**：独立 `LFTTDO Astryx` 版本加载 Astryx UI，仍走 mock；默认 LFTTDO 不受影响。
 2. **P2 真实文本**：真实模型流式、会话列表、历史加载。
 3. **P3 真实工具**：工具卡、权限卡、提问弹窗、停止、重试。
 4. **P4 设置与产物**：设置、图片、工作区、导出、文件定位。
@@ -25,7 +26,7 @@
 
 每一步完成后单独提交，不做“大爆炸合并”。
 
-## 2. P1：脚手架与 Tauri 外壳
+## 2. P1：脚手架与独立 Tauri 版本
 
 ### 任务
 
@@ -43,15 +44,26 @@
    ```json
    "dev:astryx": "npm --prefix astryx-ui run dev",
    "build:astryx": "npm --prefix astryx-ui run build",
-   "test:astryx": "npm --prefix astryx-ui run test"
+   "test:astryx": "npm --prefix astryx-ui run test",
+   "tauri:astryx": "tauri dev --config src-tauri/tauri.astryx.conf.json",
+   "tauri:astryx:build": "tauri build --config src-tauri/tauri.astryx.conf.json"
    ```
-5. 修改 `src-tauri/tauri.conf.json` 的 `build`：
+5. **不改** `src-tauri/tauri.conf.json`；新增 `src-tauri/tauri.astryx.conf.json`：
    ```json
    {
-     "beforeDevCommand": "npm run dev:astryx",
-     "devUrl": "http://localhost:5173",
-     "beforeBuildCommand": "npm run build:astryx",
-     "frontendDist": "../astryx-ui/dist"
+     "productName": "LFTTDO Astryx",
+     "identifier": "com.qwa.do.astryx",
+     "build": {
+       "beforeDevCommand": "npm run dev:astryx",
+       "devUrl": "http://localhost:5173",
+       "beforeBuildCommand": "npm run build:astryx",
+       "frontendDist": "../astryx-ui/dist"
+     },
+     "app": {
+       "windows": [
+         { "title": "LFTTDO Astryx" }
+       ]
+     }
    }
    ```
 6. 检查根 `.gitignore` 覆盖 `astryx-ui/node_modules` 与 `astryx-ui/dist`；没有就补。
@@ -60,16 +72,20 @@
 
 ```bash
 cd astryx-ui && npm install && npm run build
-cd .. && npm run tauri dev
+cd ..
+npm run tauri:astryx        # 打开 LFTTDO Astryx
+npm run tauri dev            # 打开原 LFTTDO
 ```
 
-- Tauri 窗口显示 Astryx UI。
-- 界面仍走 mock 流式，不调用真实 agent。
-- 旧 `src/` 未修改。
+- `LFTTDO Astryx` 窗口显示 Astryx UI；默认 LFTTDO 窗口仍显示原 UI。
+- Astryx 版仍走 mock 流式，不调用真实 agent。
+- 旧 `src/` 与 `tauri.conf.json` 未修改。
 - 普通浏览器 `http://localhost:5173/` 仍能打开。
 
 ### 风险
 
+- Tauri `--config` 的合并顺序要在 P1 实测；若 `tauri dev --config` 不接受，改成 `tauri --config src-tauri/tauri.astryx.conf.json dev`。
+- 独立 productName / identifier 是否能让两个安装器并存，P5 实测；必要时设置独立 `mainBinaryName`。
 - Tauri `beforeDevCommand` 在 Windows 下对 `npm --prefix` 的解析要实测；若失败，改成 `node scripts/astryx-dev.mjs` 启动子进程。
 - 端口 5173 被占用时 strictPort 会直接失败，先关掉旧的 Vite。
 
@@ -230,10 +246,10 @@ cargo fmt --check
 ### 打包
 
 ```bash
-npm run tauri build
+npm run tauri:astryx:build
 ```
 
-至少确认能产出 NSIS 安装包；若因环境失败，记录原因。
+确认能产出独立的 `LFTTDO Astryx` NSIS 安装包；默认 LFTTDO 的 `npm run tauri build` 仍应可用。若因环境失败，记录原因。
 
 ## 7. 提交与分支纪律
 
@@ -248,9 +264,9 @@ npm run tauri build
 
 ## 8. 回退
 
-- P1 后要回旧 UI：恢复 `src-tauri/tauri.conf.json` 的 `build` 四键，删除 `astryx-ui/` 与根 scripts。
-- P2+ 出问题：保留 `astryx-ui/`，把 `useAgent` 强制切回 mock，Tauri 外壳仍可打开 UI。
-- Rust 未改动，无需数据库迁移；回退不涉及数据修复。
+- P1 后要移除 Astryx 版：删除 `astryx-ui/`、`src-tauri/tauri.astryx.conf.json` 与根 scripts；默认 `tauri.conf.json` 从未修改，原版不受影响。
+- P2+ 出问题：保留 `astryx-ui/`，把 `useAgent` 强制切回 mock，Astryx 外壳仍可打开 UI；默认 LFTTDO 始终可用。
+- Rust 未改动，无需数据库迁移；独立数据目录在 `%APPDATA%\com.qwa.do.astryx\`，删除它即可清理 Astryx 版数据。
 
 ## 9. 阻塞条件
 
@@ -274,6 +290,8 @@ npm install
 npm run build
 
 cd ..
+npm run tauri:astryx
+# 可选：确认默认版本仍能启动
 npm run tauri dev
 ```
 
