@@ -1,7 +1,10 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { AppShell } from '@astryxdesign/core/AppShell';
+import { Button } from '@astryxdesign/core/Button';
 import { VStack } from '@astryxdesign/core/VStack';
 import { ChatLayout } from '@astryxdesign/core/Chat';
+import { Spinner } from '@astryxdesign/core/Spinner';
+import { Text } from '@astryxdesign/core/Text';
 import { useToast } from '@astryxdesign/core/Toast';
 import { defineTheme, Theme } from '@astryxdesign/core/theme';
 
@@ -17,7 +20,14 @@ import {
   models,
   newSession,
 } from './data/mockData';
-import { useMockAgent } from './hooks/useMockAgent';
+import { client, errorMessage, isTauri } from './agent/lfttdo/client';
+import {
+  rawSettingsOf,
+  sessionRowsFromLfttdo,
+  settingsFromLfttdo,
+  settingsWithModel,
+} from './agent/lfttdo/mapping';
+import { useAgent } from './hooks/useAgent';
 import { SessionSidebar } from './components/SessionSidebar';
 import { WorkspaceBar } from './components/WorkspaceBar';
 import { ChatPane } from './components/ChatPane';
@@ -108,6 +118,13 @@ function decisionLabel(decision) {
   if (decision === 'once') return '已放行（仅本次）';
   if (decision === 'session') return '已放行（本会话内）';
   return '待处理';
+}
+
+/** 设计 5.5：删除当前会话后切到最近更新的一条，而不是数组顺序里的第一条。 */
+function mostRecentSession(list) {
+  return [...(list ?? [])].sort(
+    (a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0)
+  )[0];
 }
 
 function serializeSessionMarkdown(session) {
@@ -228,8 +245,13 @@ export default function App() {
   const [workspaceHooksEnabled, setWorkspaceHooksEnabled] = useState(false);
   const [dismissedQuestionId, setDismissedQuestionId] = useState(null);
 
+  // Tauri 里走真实内核：启动要先加载 settings/sessions，加载失败给出可重试错误。
+  const real = isTauri();
+  const rawSettingsRef = useRef(null);
+  const [boot, setBoot] = useState(real ? { status: 'loading' } : { status: 'ready' });
+
   const showToast = useToast();
-  const agent = useMockAgent({ sessions, settings, setSessions, setUsage });
+  const agent = useAgent({ sessions, settings, setSessions, setUsage, showToast });
 
   const activeSession =
     sessions.find((session) => session.id === activeId) ??
@@ -255,6 +277,50 @@ export default function App() {
   })();
   const questionDialogOpen =
     Boolean(pendingQuestion) && pendingQuestion.id !== dismissedQuestionId;
+
+  // 状态栏分母：真实模式由 usage 事件携带 budget（spec §11.3），mock/未加载时用设置兜底。
+  const contextBudget = usage?.contextBudget ?? settings.contextBudget;
+
+  // 真实模式的模型下拉 = 当前模型 + 静态建议列表，不伪造可用性（spec §10.7）。
+  const modelOptions = real
+    ? Array.from(new Set([settings.model, ...models].filter(Boolean)))
+    : models;
+
+  async function bootReal() {
+    setBoot({ status: 'loading' });
+    try {
+      const [view, rows] = await Promise.all([client.settingsGet(), client.sessionList()]);
+      rawSettingsRef.current = rawSettingsOf(view);
+      const mappedSettings = settingsFromLfttdo(view);
+      let nextSessions = sessionRowsFromLfttdo(rows);
+      if (nextSessions.length === 0) {
+        // 空库先建一个会话，避免空态（spec §7.1）。
+        const id = await client.sessionCreate();
+        nextSessions = [{ id, title: '新对话', updatedAt: new Date().toISOString(), messages: [] }];
+      }
+      setSettings(mappedSettings);
+      setSessions(nextSessions);
+      setActiveId(mostRecentSession(nextSessions).id);
+      setWorkspacePath(mappedSettings.roots[0] ?? null);
+      setUsage({ inputTokens: 0, outputTokens: 0, contextTokens: 0 });
+      setBoot({ status: 'ready' });
+    } catch (error) {
+      setBoot({ status: 'error', message: errorMessage(error) });
+    }
+  }
+
+  useEffect(() => {
+    if (real) bootReal();
+    // 启动只跑一次；bootReal 内部自己 setState。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 首次激活某个会话时拉一次历史（spec §7.1/§7.3）；同一会话只加载一次。
+  const hydrateSession = agent.hydrateSession;
+  useEffect(() => {
+    if (!real || boot.status !== 'ready') return;
+    hydrateSession?.(activeId);
+  }, [real, boot.status, activeId, hydrateSession]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.matchMedia) return undefined;
@@ -300,52 +366,123 @@ export default function App() {
     setOpenPanel(null);
   }
 
-  function handleCreateSession() {
-    const next = newSession('新对话');
-    setSessions((prev) => [next, ...prev]);
-    setActiveId(next.id);
-    setDraftFor(next.id, '');
-    setPendingImages([]);
-    setUsage({ inputTokens: 0, outputTokens: 0, contextTokens: 0 });
+  async function handleCreateSession() {
+    if (!real) {
+      const next = newSession('新对话');
+      setSessions((prev) => [next, ...prev]);
+      setActiveId(next.id);
+      setDraftFor(next.id, '');
+      setPendingImages([]);
+      setUsage({ inputTokens: 0, outputTokens: 0, contextTokens: 0 });
+      return;
+    }
+    try {
+      const id = await client.sessionCreate();
+      setSessions((prev) => [
+        { id, title: '新对话', updatedAt: new Date().toISOString(), messages: [] },
+        ...prev,
+      ]);
+      setActiveId(id);
+      setDraftFor(id, '');
+      setPendingImages([]);
+    } catch (error) {
+      showToast({ body: `新建会话失败：${errorMessage(error)}`, type: 'error' });
+    }
   }
 
-  function handleRenameSession(sessionId, title) {
-    setSessions((prev) =>
-      prev.map((session) =>
-        session.id === sessionId ? { ...session, title } : session
-      )
-    );
+  async function refreshSessionsReal() {
+    try {
+      const rows = await client.sessionList();
+      let mapped = [];
+      setSessions((prev) => {
+        mapped = sessionRowsFromLfttdo(rows).map((row) => ({
+          ...row,
+          messages: prev.find((session) => session.id === row.id)?.messages ?? [],
+        }));
+        return mapped;
+      });
+      return mapped;
+    } catch (error) {
+      showToast({ body: `刷新会话列表失败：${errorMessage(error)}`, type: 'error' });
+      return null;
+    }
   }
 
-  function handleDeleteSession(sessionId) {
-    const remaining = sessions.filter((session) => session.id !== sessionId);
+  async function handleRenameSession(sessionId, title) {
+    if (!real) {
+      setSessions((prev) =>
+        prev.map((session) =>
+          session.id === sessionId ? { ...session, title } : session
+        )
+      );
+      return;
+    }
+    try {
+      await client.sessionRename(sessionId, title);
+      await refreshSessionsReal();
+    } catch (error) {
+      showToast({ body: `重命名失败：${errorMessage(error)}`, type: 'error' });
+    }
+  }
 
-    if (remaining.length === 0) {
-      const fresh = newSession('新对话');
-      setSessions([fresh]);
-      setActiveId(fresh.id);
-      setDrafts({ [fresh.id]: '' });
-    } else {
-      setSessions(remaining);
-      if (sessionId === activeId || !remaining.some((session) => session.id === activeId)) {
-        // 设计 5.5：删除当前会话后切到最近更新的一条，而不是数组顺序里的第一条。
-        const mostRecent = [...remaining].sort(
-          (a, b) =>
-            (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0)
-        )[0];
-        setActiveId(mostRecent.id);
+  async function handleDeleteSession(sessionId) {
+    if (!real) {
+      const remaining = sessions.filter((session) => session.id !== sessionId);
+
+      if (remaining.length === 0) {
+        const fresh = newSession('新对话');
+        setSessions([fresh]);
+        setActiveId(fresh.id);
+        setDrafts({ [fresh.id]: '' });
+      } else {
+        setSessions(remaining);
+        if (sessionId === activeId || !remaining.some((session) => session.id === activeId)) {
+          setActiveId(mostRecentSession(remaining).id);
+        }
+        setDrafts((prev) => {
+          const next = { ...prev };
+          delete next[sessionId];
+          return next;
+        });
       }
+
+      setPendingImages([]);
+      return;
+    }
+
+    try {
+      await client.sessionDelete(sessionId);
+      agent.forgetSession?.(sessionId);
       setDrafts((prev) => {
         const next = { ...prev };
         delete next[sessionId];
         return next;
       });
+      setPendingImages([]);
+      const remaining = await refreshSessionsReal();
+      if (!remaining) return;
+      if (remaining.length === 0) {
+        // 空库回到「始终有一个会话」的启动态（spec §7.1）。
+        const id = await client.sessionCreate();
+        const fresh = { id, title: '新对话', updatedAt: new Date().toISOString(), messages: [] };
+        setSessions([fresh]);
+        setActiveId(id);
+        return;
+      }
+      if (sessionId === activeId || !remaining.some((session) => session.id === activeId)) {
+        setActiveId(mostRecentSession(remaining).id);
+      }
+    } catch (error) {
+      showToast({ body: `删除会话失败：${errorMessage(error)}`, type: 'error' });
     }
-
-    setPendingImages([]);
   }
 
   function handleExportSession(sessionId) {
+    if (real) {
+      // 导出走 Rust 的原生保存对话框（spec §10.6），P4 接入；不用 Blob 下载冒充。
+      showToast({ body: '导出将在后续阶段接入真实保存' });
+      return;
+    }
     const session = sessions.find((item) => item.id === sessionId);
     if (!session) {
       showToast({ body: '导出失败', type: 'error' });
@@ -371,6 +508,12 @@ export default function App() {
   }
 
   function handleOpenPanel(nextPanel) {
+    if (real) {
+      // 技能/MCP/Hooks/设置面板的数据都还没接真实命令（spec §12.7），
+      // 打开只会展示 mock 冒充真实数据，所以统一拦截。
+      showToast({ body: '该面板将在后续阶段接入真实数据' });
+      return;
+    }
     setOpenPanel((current) => (current === nextPanel ? null : nextPanel));
   }
 
@@ -379,22 +522,53 @@ export default function App() {
   }
 
   function handleChooseWorkspace() {
+    if (real) {
+      showToast({ body: '工作文件夹将在后续阶段接入' });
+      return;
+    }
     setWorkspacePath(CHOSEN_WORKSPACE);
     showToast({ body: '已选择工作文件夹' });
   }
 
   function handleClearWorkspace() {
+    if (real) {
+      showToast({ body: '工作文件夹将在后续阶段接入' });
+      return;
+    }
     setWorkspacePath(null);
     showToast({ body: '已清除工作文件夹' });
   }
 
   function handleRevealWorkspace() {
+    if (real) {
+      showToast({ body: '文件定位将在后续阶段接入' });
+      return;
+    }
     showToast({ body: '已在资源管理器中显示' });
   }
 
-  function handleModelChange(model) {
+  async function handleModelChange(model) {
+    if (!real) {
+      handleSettingChange('model', model);
+      showToast({ body: `已切换到 ${model}` });
+      return;
+    }
+    // 真实模式必须落盘，否则下一轮模型调用仍是旧值，界面在撒谎（spec §10.7）。
+    const raw = rawSettingsRef.current;
+    if (!raw) {
+      showToast({ body: '设置尚未加载完成，切换未保存', type: 'error' });
+      return;
+    }
     handleSettingChange('model', model);
-    showToast({ body: `已切换到 ${model}` });
+    try {
+      const next = settingsWithModel(raw, model);
+      await client.settingsSet(next);
+      rawSettingsRef.current = next;
+      showToast({ body: `已切换到 ${model}` });
+    } catch (error) {
+      handleSettingChange('model', raw.model ?? settings.model);
+      showToast({ body: `模型切换失败：${errorMessage(error)}`, type: 'error' });
+    }
   }
 
   function handleSettingChange(key, value) {
@@ -549,6 +723,11 @@ export default function App() {
   }
 
   function handleAddFiles(files) {
+    if (real) {
+      // 图片要先过 Rust 的 normalize_image（spec §10.8），P4 接入。
+      showToast({ body: '图片附件将在后续阶段接入' });
+      return;
+    }
     const images = Array.from(files ?? []).filter(
       (file) => file && file.type && file.type.startsWith('image/')
     );
@@ -620,9 +799,35 @@ export default function App() {
     agent.respondPermission(permissionId, decision);
   }
 
-  function handleQuestionAnswer(questionId, answer) {
-    agent.answerQuestion(questionId, answer);
-    setDismissedQuestionId(null);
+  async function handleQuestionAnswer(questionId, answer) {
+    const ok = await agent.answerQuestion(questionId, answer);
+    // 真实模式返回 false = 这道提问已失效：关掉弹窗，不再重开（spec §10.4）。
+    setDismissedQuestionId(ok === false ? questionId : null);
+  }
+
+  // 启动门（spec §7.1）：加载失败可重试；所有 hook 已在上面执行完，这里才允许提前返回。
+  if (boot.status === 'loading') {
+    return (
+      <Theme theme={runtimeTheme} mode="dark">
+        <AppShell height="fill" contentPadding={0} variant="elevated">
+          <VStack height="100%" align="center" justify="center" gap={3}>
+            <Spinner size="lg" shade="subtle" label="正在连接 LFTTDO 内核…" />
+          </VStack>
+        </AppShell>
+      </Theme>
+    );
+  }
+  if (boot.status === 'error') {
+    return (
+      <Theme theme={runtimeTheme} mode="dark">
+        <AppShell height="fill" contentPadding={0} variant="elevated">
+          <VStack height="100%" align="center" justify="center" gap={3} padding={5}>
+            <Text type="body">连接 LFTTDO 内核失败：{boot.message}</Text>
+            <Button label="重试" variant="secondary" onClick={bootReal} />
+          </VStack>
+        </AppShell>
+      </Theme>
+    );
   }
 
   return (
@@ -666,12 +871,12 @@ export default function App() {
                 onAddFiles={handleAddFiles}
                 onRemoveImage={handleRemoveImage}
                 skills={skills}
-                files={fileMentions}
-                models={models}
+                files={real ? [] : fileMentions}
+                models={modelOptions}
                 modelName={settings.model}
                 onModelChange={handleModelChange}
                 usage={usage}
-                contextBudget={settings.contextBudget}
+                contextBudget={contextBudget}
               />
             }
           >
@@ -680,7 +885,7 @@ export default function App() {
               isStreaming={activeStreaming}
               settings={settings}
               usage={usage}
-              contextBudget={settings.contextBudget}
+              contextBudget={contextBudget}
               onPermission={handlePermission}
               onQuestionAnswer={handleQuestionAnswer}
               onReopenQuestion={() => setDismissedQuestionId(null)}
@@ -688,7 +893,7 @@ export default function App() {
               onRetry={handleRetry}
             />
           </ChatLayout>
-          <StatusBar usage={usage} contextBudget={settings.contextBudget} />
+          <StatusBar usage={usage} contextBudget={contextBudget} />
         </VStack>
       </AppShell>
 
