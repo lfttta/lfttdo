@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run"
   },
   "dependencies": {
     "@astryxdesign/cli": "0.7.16",
@@ -19,6 +20,7 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "5.2.0",
-    "vite": "8.3.8"
+    "vite": "8.3.8",
+    "vitest": "^5.0.5"
   }
 }
