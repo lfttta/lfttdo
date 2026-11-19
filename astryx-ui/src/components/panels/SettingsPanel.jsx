@@ -108,6 +108,16 @@ export default function SettingsPanel({
   onClearMemories,
   onImportPersona,
   onExportPersona,
+  // 真实模式传入：API Key 只走 settings_set_api_key，不落到 settings state。
+  onSaveApiKey,
+  onClearApiKey,
+  // 真实模式传 'body'：Rust 的 memory_update_body 只改正文，编辑表单隐藏类型与到期日。
+  memoryEditing = 'full',
+  persistNote = '改动即时生效；刷新页面后回到初始值。',
+  // 储存分区：mock 显示「浏览器内存」，真实模式由 App 传实际说明与打开回调。
+  storageLocation = '浏览器内存（演示）',
+  onOpenDataDir = () => showToast({ body: '已在资源管理器中打开数据目录' }),
+  onOpenWorkspaceDir = () => showToast({ body: '已在资源管理器中打开工作区目录' }),
 }) {
   const showToast = useToast();
   const contentRef = useRef(null);
@@ -159,9 +169,19 @@ export default function SettingsPanel({
     contentRef.current?.scrollTo({ top: 0 });
   }
 
-  function handleSaveKey() {
+  async function handleSaveKey() {
     const key = apiKey.trim();
     if (!key) {
+      return;
+    }
+    if (onSaveApiKey) {
+      try {
+        await onSaveApiKey(key);
+        setApiKey('');
+        setConfirmClearKey(false);
+      } catch {
+        // 保存失败由 App toast，保留输入允许重试。
+      }
       return;
     }
     onSettingChange('hasApiKey', true);
@@ -170,7 +190,17 @@ export default function SettingsPanel({
     showToast({ body: '已保存 API Key（演示）' });
   }
 
-  function handleClearKey() {
+  async function handleClearKey() {
+    if (onClearApiKey) {
+      try {
+        await onClearApiKey();
+        setApiKey('');
+        setConfirmClearKey(false);
+      } catch {
+        // 清除失败由 App toast。
+      }
+      return;
+    }
     onSettingChange('hasApiKey', false);
     setApiKey('');
     setConfirmClearKey(false);
@@ -608,15 +638,17 @@ export default function SettingsPanel({
                   onClick={() => setEditingId(null)}
                 />
               </HStack>
-              <Selector
-                label="类型"
-                value={editDraft.kind}
-                onChange={(value) =>
-                  setEditDraft((prev) => ({ ...prev, kind: value }))
-                }
-                options={KIND_OPTIONS}
-                width="100%"
-              />
+              {memoryEditing === 'full' ? (
+                <Selector
+                  label="类型"
+                  value={editDraft.kind}
+                  onChange={(value) =>
+                    setEditDraft((prev) => ({ ...prev, kind: value }))
+                  }
+                  options={KIND_OPTIONS}
+                  width="100%"
+                />
+              ) : null}
               <TextArea
                 label="内容"
                 rows={3}
@@ -626,14 +658,16 @@ export default function SettingsPanel({
                 }
                 width="100%"
               />
-              <TextInput
-                label="到期日（可选）"
-                value={editDraft.dueAt}
-                onChange={(value) =>
-                  setEditDraft((prev) => ({ ...prev, dueAt: value }))
-                }
-                placeholder="YYYY-MM-DD"
-              />
+              {memoryEditing === 'full' ? (
+                <TextInput
+                  label="到期日（可选）"
+                  value={editDraft.dueAt}
+                  onChange={(value) =>
+                    setEditDraft((prev) => ({ ...prev, dueAt: value }))
+                  }
+                  placeholder="YYYY-MM-DD"
+                />
+              ) : null}
               <HStack gap={2}>
                 <Button
                   label="保存修改"
@@ -792,14 +826,15 @@ export default function SettingsPanel({
       <VStack gap={5}>
         <SectionIntro
           title="储存"
-          description="演示数据只保存在浏览器内存，刷新后回到预置状态。"
+          // 真实模式由 App 给出数据目录说明；mock 保持原描述。
+          description={persistNote}
         />
 
         <HStack gap={2} align="center" wrap="wrap">
           <Text type="supporting" color="secondary">
             默认储存位置：
           </Text>
-          <Token label="浏览器内存（演示）" color="gray" size="sm" />
+          <Token label={storageLocation} color="gray" size="sm" />
         </HStack>
 
         <HStack gap={2} wrap="wrap">
@@ -807,17 +842,13 @@ export default function SettingsPanel({
             label="打开数据目录"
             variant="secondary"
             size="sm"
-            onClick={() =>
-              showToast({ body: '已在资源管理器中打开数据目录' })
-            }
+            onClick={onOpenDataDir}
           />
           <Button
             label="打开工作区目录"
             variant="ghost"
             size="sm"
-            onClick={() =>
-              showToast({ body: '已在资源管理器中打开工作区目录' })
-            }
+            onClick={onOpenWorkspaceDir}
           />
         </HStack>
       </VStack>
@@ -890,7 +921,7 @@ export default function SettingsPanel({
           <LayoutFooter hasDivider>
             <HStack justify="between" align="center" gap={3} wrap="wrap">
               <Text type="supporting" color="secondary">
-                改动即时生效；刷新页面后回到初始值。
+                {persistNote}
               </Text>
               <Button
                 label="关闭"

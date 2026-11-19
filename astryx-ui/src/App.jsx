@@ -22,10 +22,16 @@ import {
 } from './data/mockData';
 import { client, errorMessage, isTauri } from './agent/lfttdo/client';
 import {
+  hooksFromLfttdo,
+  mcpServersFromLfttdo,
+  memoriesFromLfttdo,
+  memoryKindToWire,
+  dueDateToMs,
   rawSettingsOf,
   sessionRowsFromLfttdo,
   settingsFromLfttdo,
-  settingsWithModel,
+  settingsFromMapped,
+  skillsFromLfttdo,
 } from './agent/lfttdo/mapping';
 import { useAgent } from './hooks/useAgent';
 import { SessionSidebar } from './components/SessionSidebar';
@@ -249,6 +255,13 @@ export default function App() {
   const real = isTauri();
   const rawSettingsRef = useRef(null);
   const [boot, setBoot] = useState(real ? { status: 'loading' } : { status: 'ready' });
+  // 真实模式的 @ 文件提及列表（session_search_files 的结果，跟会话/工作文件夹走）。
+  const [realFileMentions, setRealFileMentions] = useState([]);
+  // 设置文本框逐键触发 onSettingChange：落盘做防抖，离散动作仍即时保存。
+  const persistTimerRef = useRef(null);
+  // 防抖回调拿到的是旧闭包：settings 的真相放 ref，落盘时现读。
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
 
   const showToast = useToast();
   const agent = useAgent({ sessions, settings, setSessions, setUsage, showToast });
@@ -289,7 +302,11 @@ export default function App() {
   async function bootReal() {
     setBoot({ status: 'loading' });
     try {
-      const [view, rows] = await Promise.all([client.settingsGet(), client.sessionList()]);
+      const [view, rows, memoryRows] = await Promise.all([
+        client.settingsGet(),
+        client.sessionList(),
+        client.memoriesList(),
+      ]);
       rawSettingsRef.current = rawSettingsOf(view);
       const mappedSettings = settingsFromLfttdo(view);
       let nextSessions = sessionRowsFromLfttdo(rows);
@@ -302,6 +319,7 @@ export default function App() {
       setSessions(nextSessions);
       setActiveId(mostRecentSession(nextSessions).id);
       setWorkspacePath(mappedSettings.roots[0] ?? null);
+      setMemories(memoriesFromLfttdo(memoryRows));
       setUsage({ inputTokens: 0, outputTokens: 0, contextTokens: 0 });
       setBoot({ status: 'ready' });
     } catch (error) {
@@ -321,6 +339,36 @@ export default function App() {
     if (!real || boot.status !== 'ready') return;
     hydrateSession?.(activeId);
   }, [real, boot.status, activeId, hydrateSession]);
+
+  // 真实模式：工作文件夹与 @ 文件提及都跟着会话走（spec §10.6 / §12.5）。
+  const refreshWorkspaceReal = async (sessionId) => {
+    if (!sessionId) return;
+    try {
+      const view = await client.sessionOutputView(sessionId);
+      setWorkspacePath(view.workspace ?? null);
+    } catch (error) {
+      showToast({ body: `读取工作文件夹失败：${errorMessage(error)}`, type: 'error' });
+    }
+  };
+
+  const refreshFileMentionsReal = async (sessionId) => {
+    if (!sessionId) return;
+    try {
+      setRealFileMentions(await client.sessionSearchFiles(sessionId, ''));
+    } catch (error) {
+      // 文件提及是辅助数据：失败静默留空，不挡对话。
+      setRealFileMentions([]);
+      showToast({ body: `文件提及刷新失败：${errorMessage(error)}`, type: 'error' });
+    }
+  };
+
+  useEffect(() => {
+    if (!real || boot.status !== 'ready' || !activeId) return;
+    refreshWorkspaceReal(activeId);
+    refreshFileMentionsReal(activeId);
+    // 两个刷新都只依赖会话与启动状态。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [real, boot.status, activeId]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.matchMedia) return undefined;
@@ -477,10 +525,15 @@ export default function App() {
     }
   }
 
-  function handleExportSession(sessionId) {
+  async function handleExportSession(sessionId) {
     if (real) {
-      // 导出走 Rust 的原生保存对话框（spec §10.6），P4 接入；不用 Blob 下载冒充。
-      showToast({ body: '导出将在后续阶段接入真实保存' });
+      // Rust 弹原生保存对话框（spec §10.6），返回保存路径或 null（用户取消）。
+      try {
+        const path = await client.sessionExport(sessionId);
+        showToast({ body: path ? `已导出：${path}` : '导出已取消' });
+      } catch (error) {
+        showToast({ body: `导出失败：${errorMessage(error)}`, type: 'error' });
+      }
       return;
     }
     const session = sessions.find((item) => item.id === sessionId);
@@ -509,10 +562,10 @@ export default function App() {
 
   function handleOpenPanel(nextPanel) {
     if (real) {
-      // 技能/MCP/Hooks/设置面板的数据都还没接真实命令（spec §12.7），
-      // 打开只会展示 mock 冒充真实数据，所以统一拦截。
-      showToast({ body: '该面板将在后续阶段接入真实数据' });
-      return;
+      // 面板数据每次打开都现读（skills.rs 的纪律：磁盘是唯一真相源）。
+      if (nextPanel === 'skills') refreshSkillsReal();
+      if (nextPanel === 'mcp') refreshMcpReal();
+      if (nextPanel === 'hooks') refreshHooksReal();
     }
     setOpenPanel((current) => (current === nextPanel ? null : nextPanel));
   }
@@ -521,18 +574,34 @@ export default function App() {
     setOpenPanel(null);
   }
 
-  function handleChooseWorkspace() {
+  async function handleChooseWorkspace() {
     if (real) {
-      showToast({ body: '工作文件夹将在后续阶段接入' });
+      try {
+        const picked = await client.pickFolder();
+        if (!picked) return;
+        await client.sessionWorkspaceSet(activeId, picked);
+        await refreshWorkspaceReal(activeId);
+        await refreshFileMentionsReal(activeId);
+        showToast({ body: '已设置会话工作文件夹' });
+      } catch (error) {
+        showToast({ body: `设置工作文件夹失败：${errorMessage(error)}`, type: 'error' });
+      }
       return;
     }
     setWorkspacePath(CHOSEN_WORKSPACE);
     showToast({ body: '已选择工作文件夹' });
   }
 
-  function handleClearWorkspace() {
+  async function handleClearWorkspace() {
     if (real) {
-      showToast({ body: '工作文件夹将在后续阶段接入' });
+      try {
+        await client.sessionWorkspaceSet(activeId, null);
+        await refreshWorkspaceReal(activeId);
+        await refreshFileMentionsReal(activeId);
+        showToast({ body: '已清除会话工作文件夹' });
+      } catch (error) {
+        showToast({ body: `清除工作文件夹失败：${errorMessage(error)}`, type: 'error' });
+      }
       return;
     }
     setWorkspacePath(null);
@@ -541,7 +610,13 @@ export default function App() {
 
   function handleRevealWorkspace() {
     if (real) {
-      showToast({ body: '文件定位将在后续阶段接入' });
+      if (!workspacePath) {
+        showToast({ body: '这个会话还没有工作文件夹' });
+        return;
+      }
+      client
+        .revealPath(activeId, workspacePath)
+        .catch((error) => showToast({ body: `定位失败：${errorMessage(error)}`, type: 'error' }));
       return;
     }
     showToast({ body: '已在资源管理器中显示' });
@@ -561,7 +636,7 @@ export default function App() {
     }
     handleSettingChange('model', model);
     try {
-      const next = settingsWithModel(raw, model);
+      const next = settingsFromMapped(raw, { ...settingsRef.current, model });
       await client.settingsSet(next);
       rawSettingsRef.current = next;
       showToast({ body: `已切换到 ${model}` });
@@ -588,11 +663,79 @@ export default function App() {
       }
       return { ...prev, [key]: nextValue };
     });
+    // 真实模式：文本框逐键触发，落盘做 600ms 防抖；model 由 handleModelChange 即时保存，
+    // hasApiKey 不是 Settings 字段（API Key 只走 settings_set_api_key）。
+    if (real && key !== 'model' && key !== 'hasApiKey') {
+      if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = setTimeout(() => {
+        persistTimerRef.current = null;
+        persistSettingsReal();
+      }, 600);
+    }
   }
 
-  function handleAddMemory({ kind, body, dueAt }) {
+  async function persistSettingsReal() {
+    const raw = rawSettingsRef.current;
+    if (!raw) return;
+    try {
+      const next = settingsFromMapped(raw, settingsRef.current);
+      await client.settingsSet(next);
+      rawSettingsRef.current = next;
+    } catch (error) {
+      showToast({ body: `设置保存失败：${errorMessage(error)}`, type: 'error' });
+    }
+  }
+
+  async function refreshMemoriesReal() {
+    try {
+      setMemories(memoriesFromLfttdo(await client.memoriesList()));
+    } catch (error) {
+      showToast({ body: `记忆列表刷新失败：${errorMessage(error)}`, type: 'error' });
+    }
+  }
+
+  function refreshSkillsReal() {
+    client
+      .skillsList()
+      .then((view) => setSkills(skillsFromLfttdo(view)))
+      .catch((error) => showToast({ body: `技能列表刷新失败：${errorMessage(error)}`, type: 'error' }));
+  }
+
+  function refreshMcpReal() {
+    client
+      .mcpServers()
+      .then((rows) => setMcpServers(mcpServersFromLfttdo(rows)))
+      .catch((error) => showToast({ body: `MCP 列表刷新失败：${errorMessage(error)}`, type: 'error' }));
+    client
+      .mcpConfigRead()
+      .then((view) => setMcpJson(view.text ?? ''))
+      .catch((error) => showToast({ body: `MCP 配置读取失败：${errorMessage(error)}`, type: 'error' }));
+  }
+
+  function refreshHooksReal() {
+    client
+      .hooksList(activeId)
+      .then((view) => {
+        const mapped = hooksFromLfttdo(view);
+        setHooks(mapped.hooks);
+        setWorkspaceHooksEnabled(mapped.workspaceEnabled);
+      })
+      .catch((error) => showToast({ body: `Hooks 列表刷新失败：${errorMessage(error)}`, type: 'error' }));
+  }
+
+  async function handleAddMemory({ kind, body, dueAt }) {
     const text = String(body ?? '').trim();
     if (!text) return;
+    if (real) {
+      try {
+        await client.memoryAdd(memoryKindToWire(kind), text, dueDateToMs(dueAt));
+        await refreshMemoriesReal();
+        showToast({ body: '已记住' });
+      } catch (error) {
+        showToast({ body: `新增记忆失败：${errorMessage(error)}`, type: 'error' });
+      }
+      return;
+    }
     setMemories((prev) => [
       {
         id: `memory-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -605,19 +748,77 @@ export default function App() {
     showToast({ body: '已记住' });
   }
 
-  function handleUpdateMemory(id, patch) {
+  async function handleUpdateMemory(id, patch) {
+    if (real) {
+      // Rust 只暴露正文修改（memory_update_body）：面板在真实模式隐藏类型/到期日编辑。
+      try {
+        await client.memoryUpdateBody(Number(id), String(patch.body ?? ''));
+        await refreshMemoriesReal();
+        showToast({ body: '记忆已更新' });
+      } catch (error) {
+        showToast({ body: `记忆更新失败：${errorMessage(error)}`, type: 'error' });
+      }
+      return;
+    }
     setMemories((prev) =>
       prev.map((memory) => (memory.id === id ? { ...memory, ...patch } : memory))
     );
   }
 
-  function handleDeleteMemory(id) {
+  async function handleDeleteMemory(id) {
+    if (real) {
+      try {
+        await client.memoriesDelete(Number(id));
+        await refreshMemoriesReal();
+        showToast({ body: '已删除记忆' });
+      } catch (error) {
+        showToast({ body: `删除记忆失败：${errorMessage(error)}`, type: 'error' });
+      }
+      return;
+    }
     setMemories((prev) => prev.filter((memory) => memory.id !== id));
   }
 
-  function handleClearMemories() {
+  async function handleClearMemories() {
+    if (real) {
+      try {
+        await client.memoriesClear();
+        await refreshMemoriesReal();
+        showToast({ body: '已清空长期记忆' });
+      } catch (error) {
+        showToast({ body: `清空记忆失败：${errorMessage(error)}`, type: 'error' });
+      }
+      return;
+    }
     setMemories([]);
     showToast({ body: '已清空长期记忆' });
+  }
+
+  async function handleSaveApiKey(key) {
+    // key 只走 settings_set_api_key，不进 settings.json（R83/spec §473）。
+    try {
+      await client.settingsSetApiKey(key);
+      const view = await client.settingsGet();
+      rawSettingsRef.current = rawSettingsOf(view);
+      setSettings(settingsFromLfttdo(view));
+      showToast({ body: '已保存 API Key' });
+    } catch (error) {
+      showToast({ body: `API Key 保存失败：${errorMessage(error)}`, type: 'error' });
+      throw error;
+    }
+  }
+
+  async function handleClearApiKey() {
+    try {
+      await client.settingsSetApiKey('');
+      const view = await client.settingsGet();
+      rawSettingsRef.current = rawSettingsOf(view);
+      setSettings(settingsFromLfttdo(view));
+      showToast({ body: '已清除 API Key' });
+    } catch (error) {
+      showToast({ body: `API Key 清除失败：${errorMessage(error)}`, type: 'error' });
+      throw error;
+    }
   }
 
   function handleImportPersona() {
@@ -661,7 +862,23 @@ export default function App() {
     }
   }
 
-  function handleToggleSkill(name, enabled) {
+  async function handleToggleSkill(name, enabled) {
+    if (real) {
+      // 启用键是 folder（skills_set_enabled 的键），不是显示名。
+      const skill = skills.find((item) => item.name === name);
+      if (!skill?.folder) {
+        showToast({ body: '找不到这条技能的目录名', type: 'error' });
+        return;
+      }
+      try {
+        await client.skillsSetEnabled(skill.folder, enabled);
+        refreshSkillsReal();
+        showToast({ body: enabled ? `已启用 ${name}` : `已停用 ${name}` });
+      } catch (error) {
+        showToast({ body: `技能切换失败：${errorMessage(error)}`, type: 'error' });
+      }
+      return;
+    }
     setSkills((prev) =>
       prev.map((skill) =>
         skill.name === name ? { ...skill, enabled } : skill
@@ -682,7 +899,18 @@ export default function App() {
     showToast({ body: insertion });
   }
 
-  function handleSetMcpTrust(name, trust) {
+  async function handleSetMcpTrust(name, trust) {
+    if (real) {
+      // 面板的 allow 在 Rust 侧叫 auto（parse_trust 只认 auto/ask/block）。
+      try {
+        await client.mcpSetTrust(name, trust === 'allow' ? 'auto' : trust);
+        refreshMcpReal();
+        showToast({ body: `${name} 信任档已更新` });
+      } catch (error) {
+        showToast({ body: `信任档更新失败：${errorMessage(error)}`, type: 'error' });
+      }
+      return;
+    }
     setMcpServers((prev) =>
       prev.map((server) =>
         server.name === name ? { ...server, trust } : server
@@ -703,29 +931,99 @@ export default function App() {
     const result = validateMcpConfig(mcpJson);
     setMcpValidation(result);
     if (result.status === 'valid') {
+      if (real) {
+        // 真实保存走 mcp_config_save：Rust 校验形状并落盘，重启后重新连接。
+        client
+          .mcpConfigSave(mcpJson)
+          .then(() =>
+            showToast({
+              body: '配置已保存，重启应用后生效。当前会话仍按启动时的连接与工具运行。',
+            })
+          )
+          .catch((error) =>
+            showToast({ body: `配置保存失败：${errorMessage(error)}`, type: 'error' })
+          );
+        return;
+      }
       showToast({
         body: '配置已保存，重启应用后生效。当前会话仍按启动时的连接与工具运行。',
       });
     }
   }
 
-  function handleToggleHookTrust(id, trusted) {
+  async function handleToggleHookTrust(id, trusted) {
+    if (real) {
+      // id 就是 digest（含作用域前缀），原样递回（hooks.rs 的信任键）。
+      try {
+        await client.hooksSetTrusted(id, trusted);
+        refreshHooksReal();
+        showToast({ body: trusted ? '已信任这条 hook' : '已撤销信任' });
+      } catch (error) {
+        showToast({ body: `信任状态更新失败：${errorMessage(error)}`, type: 'error' });
+      }
+      return;
+    }
     setHooks((prev) =>
       prev.map((hook) => (hook.id === id ? { ...hook, trusted } : hook))
     );
   }
 
-  function handleToggleWorkspaceHooks(enabled) {
+  async function handleToggleWorkspaceHooks(enabled) {
+    if (real) {
+      try {
+        await client.hooksSetWorkspaceEnabled(enabled);
+        refreshHooksReal();
+        showToast({
+          body: enabled ? '已启用工作区级 hooks' : '已停用工作区级 hooks',
+        });
+      } catch (error) {
+        showToast({ body: `工作区 hooks 切换失败：${errorMessage(error)}`, type: 'error' });
+      }
+      return;
+    }
     setWorkspaceHooksEnabled(enabled);
     showToast({
       body: enabled ? '已启用工作区级 hooks' : '已停用工作区级 hooks',
     });
   }
 
-  function handleAddFiles(files) {
+  async function handleAddFiles(files) {
     if (real) {
-      // 图片要先过 Rust 的 normalize_image（spec §10.8），P4 接入。
-      showToast({ body: '图片附件将在后续阶段接入' });
+      // 每张图的原始字节交给 Rust 归一化（spec §10.8）：Rust 是唯一的图片闸门。
+      const images = Array.from(files ?? []).filter(
+        (file) => file && file.type && file.type.startsWith('image/')
+      );
+      if (images.length === 0) return;
+
+      const room = Math.max(0, 4 - pendingImages.length);
+      const accepted = images.slice(0, room);
+      const ignored = images.length - accepted.length;
+      if (ignored > 0) {
+        showToast({ body: `一次最多 4 张，已忽略 ${ignored} 张`, type: 'error' });
+      }
+
+      for (const file of accepted) {
+        try {
+          const bytes = await file.arrayBuffer();
+          const block = await client.normalizeImage(bytes);
+          if (block?.type !== 'image') {
+            throw new Error('归一化结果不是图片块');
+          }
+          setPendingImages((prev) => {
+            if (prev.length >= 4) return prev;
+            return [
+              ...prev,
+              {
+                id: `pending-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                name: file.name || '图片',
+                url: `data:${block.mime};base64,${block.data}`,
+              },
+            ];
+          });
+        } catch (error) {
+          showToast({ body: `图片处理失败：${file.name}：${errorMessage(error)}`, type: 'error' });
+        }
+      }
       return;
     }
     const images = Array.from(files ?? []).filter(
@@ -797,6 +1095,31 @@ export default function App() {
 
   function handlePermission(permissionId, decision) {
     agent.respondPermission(permissionId, decision);
+  }
+
+  function handleOpenDataDir() {
+    if (real) {
+      // hooks_open_folder 的缺省语义就是打开用户数据目录（ipc.rs:2693）。
+      client
+        .hooksOpenFolder(null, false)
+        .catch((error) => showToast({ body: `打开数据目录失败：${errorMessage(error)}`, type: 'error' }));
+      return;
+    }
+    showToast({ body: '已在资源管理器中打开数据目录' });
+  }
+
+  function handleOpenWorkspaceDir() {
+    if (real) {
+      if (!workspacePath) {
+        showToast({ body: '这个会话还没有工作文件夹' });
+        return;
+      }
+      client
+        .hooksOpenFolder(activeId, true)
+        .catch((error) => showToast({ body: `打开工作区目录失败：${errorMessage(error)}`, type: 'error' }));
+      return;
+    }
+    showToast({ body: '已在资源管理器中打开工作区目录' });
   }
 
   async function handleQuestionAnswer(questionId, answer) {
@@ -871,7 +1194,7 @@ export default function App() {
                 onAddFiles={handleAddFiles}
                 onRemoveImage={handleRemoveImage}
                 skills={skills}
-                files={real ? [] : fileMentions}
+                files={real ? realFileMentions : fileMentions}
                 models={modelOptions}
                 modelName={settings.model}
                 onModelChange={handleModelChange}
@@ -909,6 +1232,15 @@ export default function App() {
         onClearMemories={handleClearMemories}
         onImportPersona={handleImportPersona}
         onExportPersona={handleExportPersona}
+        onSaveApiKey={real ? handleSaveApiKey : undefined}
+        onClearApiKey={real ? handleClearApiKey : undefined}
+        memoryEditing={real ? 'body' : 'full'}
+        persistNote={real ? '改动即时生效并写入设置文件。' : undefined}
+        storageLocation={
+          real ? '应用数据目录（LFTTDO Astryx 独立目录）' : undefined
+        }
+        onOpenDataDir={handleOpenDataDir}
+        onOpenWorkspaceDir={handleOpenWorkspaceDir}
       />
 
       <SkillsPanel
