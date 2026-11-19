@@ -663,9 +663,10 @@ export default function App() {
       }
       return { ...prev, [key]: nextValue };
     });
-    // 真实模式：文本框逐键触发，落盘做 600ms 防抖；model 由 handleModelChange 即时保存，
-    // hasApiKey 不是 Settings 字段（API Key 只走 settings_set_api_key）。
-    if (real && key !== 'model' && key !== 'hasApiKey') {
+    // 真实模式：文本框逐键触发，落盘做 600ms 防抖（composer 换档走 handleModelChange
+    // 即时保存，这里再排一次防抖是同一份数据的幂等重写）；hasApiKey 不是 Settings 字段，
+    // API Key 只走 settings_set_api_key。
+    if (real && key !== 'hasApiKey') {
       if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
       persistTimerRef.current = setTimeout(() => {
         persistTimerRef.current = null;
@@ -1249,6 +1250,22 @@ export default function App() {
         skills={skills}
         onToggleSkill={handleToggleSkill}
         onUseSkill={handleUseSkill}
+        onRefresh={real ? () => refreshSkillsReal() : undefined}
+        onOpenFolder={
+          real
+            ? () =>
+                client
+                  .skillsOpenFolder()
+                  .catch((error) =>
+                    showToast({ body: `打开技能目录失败：${errorMessage(error)}`, type: 'error' })
+                  )
+            : undefined
+        }
+        description={
+          real
+            ? '停用的技能不会出现在输入框的 / 菜单里；列表每次现读数据目录下的技能文件夹。'
+            : undefined
+        }
       />
 
       <McpPanel
@@ -1270,6 +1287,37 @@ export default function App() {
         onToggleTrust={handleToggleHookTrust}
         workspaceHooksEnabled={workspaceHooksEnabled}
         onToggleWorkspaceHooks={handleToggleWorkspaceHooks}
+        trustNote={
+          real
+            ? '信任按声明的 SHA-256 记录；hooks.json 一改，旧 digest 自动失效回到未信任。'
+            : undefined
+        }
+        fingerprintSuffix={real ? '' : undefined}
+        onOpenConfig={
+          real
+            ? () =>
+                client
+                  .hooksOpenFolder(activeId, false)
+                  .catch((error) =>
+                    showToast({ body: `打开 hooks 目录失败：${errorMessage(error)}`, type: 'error' })
+                  )
+            : undefined
+        }
+        onOpenDataDir={
+          real
+            ? () =>
+                client
+                  .hooksOpenFolder(null, false)
+                  .catch((error) =>
+                    showToast({ body: `打开数据目录失败：${errorMessage(error)}`, type: 'error' })
+                  )
+            : undefined
+        }
+        onOpenWorkspaceDir={
+          real
+            ? () => handleOpenWorkspaceDir()
+            : undefined
+        }
       />
 
       <QuestionDialog

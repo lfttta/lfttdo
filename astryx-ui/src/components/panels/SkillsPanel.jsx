@@ -15,6 +15,10 @@ export default function SkillsPanel({
   skills = [],
   onToggleSkill,
   onUseSkill,
+  // 真实模式传入：刷新现读磁盘，打开技能文件夹走 Rust。
+  onRefresh,
+  onOpenFolder,
+  description = '停用的技能不会出现在输入框的 / 菜单里；刷新只会重新读取演示技能目录。',
 }) {
   const showToast = useToast();
   const enabledCount = skills.filter((skill) => skill.enabled).length;
@@ -53,7 +57,7 @@ export default function SkillsPanel({
           <LayoutContent label="技能列表">
             <VStack gap={4}>
               <Text type="supporting" color="secondary">
-                停用的技能不会出现在输入框的 / 菜单里；刷新只会重新读取演示技能目录。
+                {description}
               </Text>
 
               {skills.length === 0 ? (
@@ -113,14 +117,19 @@ export default function SkillsPanel({
                 variant="secondary"
                 size="sm"
                 icon={<ArrowPathIcon />}
-                onClick={() => showToast({ body: '已刷新技能目录' })}
+                onClick={
+                  onRefresh ??
+                  (() => showToast({ body: '已刷新技能目录' }))
+                }
               />
               <Button
                 label="打开技能文件夹"
                 variant="ghost"
                 size="sm"
-                onClick={() =>
-                  showToast({ body: '已在资源管理器中打开技能文件夹' })
+                onClick={
+                  onOpenFolder ??
+                  (() =>
+                    showToast({ body: '已在资源管理器中打开技能文件夹' }))
                 }
               />
               <Button

@@ -36,6 +36,12 @@ export default function HooksPanel({
   onToggleTrust,
   workspaceHooksEnabled,
   onToggleWorkspaceHooks,
+  // 真实模式传入：信任说明、指纹不再是「演示」，页脚打开动作走 Rust。
+  trustNote = '信任状态只保存在本次演示中；界面不会执行 hook 命令，也不会读取真实文件。',
+  fingerprintSuffix = '（演示）',
+  onOpenConfig,
+  onOpenDataDir,
+  onOpenWorkspaceDir,
 }) {
   const showToast = useToast();
   const [confirmingWorkspace, setConfirmingWorkspace] = useState(false);
@@ -182,7 +188,8 @@ export default function HooksPanel({
                             description={
                               <Text type="code" color="secondary">
                                 {hook.command} · 声明 SHA-256：
-                                {displayFingerprint(hook)}（演示）
+                                {displayFingerprint(hook)}
+                                {fingerprintSuffix}
                               </Text>
                             }
                             startContent={
@@ -261,7 +268,7 @@ export default function HooksPanel({
               </VStack>
 
               <Text type="supporting" color="secondary">
-                信任状态只保存在本次演示中；界面不会执行 hook 命令，也不会读取真实文件。
+                {trustNote}
               </Text>
             </VStack>
           </LayoutContent>
@@ -273,24 +280,30 @@ export default function HooksPanel({
                 label="打开 hooks.json"
                 variant="secondary"
                 size="sm"
-                onClick={() =>
-                  showToast({ body: '已在资源管理器中打开 hooks.json' })
+                onClick={
+                  onOpenConfig ??
+                  (() =>
+                    showToast({ body: '已在资源管理器中打开 hooks.json' }))
                 }
               />
               <Button
                 label="打开数据目录"
                 variant="ghost"
                 size="sm"
-                onClick={() =>
-                  showToast({ body: '已在资源管理器中打开数据目录' })
+                onClick={
+                  onOpenDataDir ??
+                  (() =>
+                    showToast({ body: '已在资源管理器中打开数据目录' }))
                 }
               />
               <Button
                 label="打开工作区目录"
                 variant="ghost"
                 size="sm"
-                onClick={() =>
-                  showToast({ body: '已在资源管理器中打开工作区目录' })
+                onClick={
+                  onOpenWorkspaceDir ??
+                  (() =>
+                    showToast({ body: '已在资源管理器中打开工作区目录' }))
                 }
               />
               <Button

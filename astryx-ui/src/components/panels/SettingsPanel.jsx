@@ -326,7 +326,11 @@ export default function SettingsPanel({
             placeholder={
               settings.hasApiKey ? '已配置，留空不修改' : '未配置'
             }
-            description="Key 只保存在本次演示的内存里，不会写入磁盘。"
+            description={
+              onSaveApiKey
+                ? 'Key 存在系统凭据管理器（qwen-do），不写入设置文件；该凭据与默认 LFTTDO 共用，保存或清除会同时影响两个版本。'
+                : 'Key 只保存在本次演示的内存里，不会写入磁盘。'
+            }
           />
           <HStack gap={2} wrap="wrap">
             <Button
