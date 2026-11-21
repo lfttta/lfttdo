@@ -302,11 +302,17 @@ export default function App() {
   async function bootReal() {
     setBoot({ status: 'loading' });
     try {
-      const [view, rows, memoryRows] = await Promise.all([
-        client.settingsGet(),
-        client.sessionList(),
-        client.memoriesList(),
-      ]);
+      const [view, rows, memoryRows, skillView, mcpRows, mcpConfig, hookView] =
+        await Promise.all([
+          client.settingsGet(),
+          client.sessionList(),
+          client.memoriesList(),
+          client.skillsList(),
+          client.mcpServers(),
+          client.mcpConfigRead(),
+          // 启动时还没有 activeId：hooks 先给用户作用域，面板打开时再带会话刷新。
+          client.hooksList(null),
+        ]);
       rawSettingsRef.current = rawSettingsOf(view);
       const mappedSettings = settingsFromLfttdo(view);
       let nextSessions = sessionRowsFromLfttdo(rows);
@@ -315,11 +321,18 @@ export default function App() {
         const id = await client.sessionCreate();
         nextSessions = [{ id, title: '新对话', updatedAt: new Date().toISOString(), messages: [] }];
       }
+      const mappedHooks = hooksFromLfttdo(hookView);
       setSettings(mappedSettings);
       setSessions(nextSessions);
       setActiveId(mostRecentSession(nextSessions).id);
       setWorkspacePath(mappedSettings.roots[0] ?? null);
       setMemories(memoriesFromLfttdo(memoryRows));
+      // 面板/斜杠菜单的数据启动就铺真实值，避免首帧顶着 mock 冒充真实（评审 P1-2）。
+      setSkills(skillsFromLfttdo(skillView));
+      setMcpServers(mcpServersFromLfttdo(mcpRows));
+      setMcpJson(mcpConfig?.text ?? '{"mcpServers": {}}');
+      setHooks(mappedHooks.hooks);
+      setWorkspaceHooksEnabled(mappedHooks.workspaceEnabled);
       setUsage({ inputTokens: 0, outputTokens: 0, contextTokens: 0 });
       setBoot({ status: 'ready' });
     } catch (error) {
@@ -333,6 +346,17 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 卸载时清掉未触发的防抖落盘定时器（评审 P2-8）。
+  useEffect(
+    () => () => {
+      if (persistTimerRef.current) {
+        clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+    },
+    []
+  );
+
   // 首次激活某个会话时拉一次历史（spec §7.1/§7.3）；同一会话只加载一次。
   const hydrateSession = agent.hydrateSession;
   useEffect(() => {
@@ -341,12 +365,18 @@ export default function App() {
   }, [real, boot.status, activeId, hydrateSession]);
 
   // 真实模式：工作文件夹与 @ 文件提及都跟着会话走（spec §10.6 / §12.5）。
+  // 用 activeIdRef 做序守卫：快速切换会话时，迟到的旧会话响应不许覆盖新会话（评审 P2-9）。
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
+
   const refreshWorkspaceReal = async (sessionId) => {
     if (!sessionId) return;
     try {
       const view = await client.sessionOutputView(sessionId);
+      if (activeIdRef.current !== sessionId) return;
       setWorkspacePath(view.workspace ?? null);
     } catch (error) {
+      if (activeIdRef.current !== sessionId) return;
       showToast({ body: `读取工作文件夹失败：${errorMessage(error)}`, type: 'error' });
     }
   };
@@ -354,9 +384,12 @@ export default function App() {
   const refreshFileMentionsReal = async (sessionId) => {
     if (!sessionId) return;
     try {
-      setRealFileMentions(await client.sessionSearchFiles(sessionId, ''));
+      const files = await client.sessionSearchFiles(sessionId, '');
+      if (activeIdRef.current !== sessionId) return;
+      setRealFileMentions(files);
     } catch (error) {
       // 文件提及是辅助数据：失败静默留空，不挡对话。
+      if (activeIdRef.current !== sessionId) return;
       setRealFileMentions([]);
       showToast({ body: `文件提及刷新失败：${errorMessage(error)}`, type: 'error' });
     }
@@ -392,10 +425,15 @@ export default function App() {
         extends: themes[defaultThemeSlug],
         typography: { scale: { base: settings.fontSize, ratio: 1.2 } },
         tokens: {
-          '--color-accent': settings.accent,
-          '--color-text-accent': settings.accent,
-          '--color-icon-accent': settings.accent,
-          '--focus-outline-color': settings.accent,
+          // 空串是 Rust 的「跟随主题预设」语义：不覆盖任何 accent 变量，让主题预设生效。
+          ...(settings.accent
+            ? {
+                '--color-accent': settings.accent,
+                '--color-text-accent': settings.accent,
+                '--color-icon-accent': settings.accent,
+                '--focus-outline-color': settings.accent,
+              }
+            : {}),
         },
       }),
     [settings.fontSize, settings.accent]
@@ -658,7 +696,7 @@ export default function App() {
       if (key === 'roots' && !Array.isArray(value)) {
         return prev;
       }
-      if (key === 'accent' && !ACCENT_VALUES.has(value)) {
+      if (key === 'accent' && value !== '' && !ACCENT_VALUES.has(value)) {
         return prev;
       }
       return { ...prev, [key]: nextValue };
@@ -720,6 +758,13 @@ export default function App() {
         const mapped = hooksFromLfttdo(view);
         setHooks(mapped.hooks);
         setWorkspaceHooksEnabled(mapped.workspaceEnabled);
+        // config_ok=false 是 Rust 明确要求上界面的警告（ipc.rs:2556）：文件坏了，hooks 不生效。
+        if (view?.config_ok === false) {
+          showToast({
+            body: 'hooks.json 解析失败，当前 hooks 不生效；请检查该文件',
+            type: 'error',
+          });
+        }
       })
       .catch((error) => showToast({ body: `Hooks 列表刷新失败：${errorMessage(error)}`, type: 'error' }));
   }
@@ -795,9 +840,18 @@ export default function App() {
     showToast({ body: '已清空长期记忆' });
   }
 
+  async function flushPendingPersist() {
+    if (!persistTimerRef.current) return;
+    clearTimeout(persistTimerRef.current);
+    persistTimerRef.current = null;
+    await persistSettingsReal();
+  }
+
   async function handleSaveApiKey(key) {
-    // key 只走 settings_set_api_key，不进 settings.json（R83/spec §473）。
+    // 先把防抖窗口内的未落盘编辑冲掉，再回读设置整体刷新（评审 P2-10）：
+    // 否则 settingsGet 的回读会把刚输入未保存的字段滚回磁盘值。
     try {
+      await flushPendingPersist();
       await client.settingsSetApiKey(key);
       const view = await client.settingsGet();
       rawSettingsRef.current = rawSettingsOf(view);
@@ -811,6 +865,7 @@ export default function App() {
 
   async function handleClearApiKey() {
     try {
+      await flushPendingPersist();
       await client.settingsSetApiKey('');
       const view = await client.settingsGet();
       rawSettingsRef.current = rawSettingsOf(view);
@@ -1017,7 +1072,9 @@ export default function App() {
               {
                 id: `pending-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
                 name: file.name || '图片',
-                url: `data:${block.mime};base64,${block.data}`,
+                // Rust ContentBlock 的 mime 是裸 "png"/"jpeg"，data URL 必须补 image/ 前缀，
+                // 否则发送端的解析正则吃不掉、<img> 预览也渲染不出来（评审 P0-1）。
+                url: `data:image/${block.mime};base64,${block.data}`,
               },
             ];
           });
@@ -1289,10 +1346,11 @@ export default function App() {
         onToggleWorkspaceHooks={handleToggleWorkspaceHooks}
         trustNote={
           real
-            ? '信任按声明的 SHA-256 记录；hooks.json 一改，旧 digest 自动失效回到未信任。'
+            ? '信任按声明内容的 SHA-256 digest 记录（见每行的信任键）；hooks.json 一改，旧 digest 自动失效回到未信任。'
             : undefined
         }
         fingerprintSuffix={real ? '' : undefined}
+        useRealDigest={real}
         onOpenConfig={
           real
             ? () =>

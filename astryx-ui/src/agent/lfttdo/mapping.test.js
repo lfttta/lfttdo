@@ -35,7 +35,7 @@ describe('settings 映射', () => {
       persona: '中文',
       contextBudget: 32000,
       fontSize: 16,
-      accent: '#7c8cff',
+      accent: '',
       permissionMode: 'ask',
       planMode: true,
       roots: ['D:\\work'],

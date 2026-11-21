@@ -39,6 +39,9 @@ export default function HooksPanel({
   // 真实模式传入：信任说明、指纹不再是「演示」，页脚打开动作走 Rust。
   trustNote = '信任状态只保存在本次演示中；界面不会执行 hook 命令，也不会读取真实文件。',
   fingerprintSuffix = '（演示）',
+  // 真实模式传 true：digest 是信任键（hook.id，Rust 的作用域前缀 SHA-256 摘要），
+  // 不能展示 displayFingerprint 的玩具哈希冒充声明摘要。
+  useRealDigest = false,
   onOpenConfig,
   onOpenDataDir,
   onOpenWorkspaceDir,
@@ -187,9 +190,10 @@ export default function HooksPanel({
                             label={<Text type="code">{hook.event}</Text>}
                             description={
                               <Text type="code" color="secondary">
-                                {hook.command} · 声明 SHA-256：
-                                {displayFingerprint(hook)}
-                                {fingerprintSuffix}
+                                {hook.command} ·{' '}
+                                {useRealDigest
+                                  ? `信任键 digest：${hook.id}`
+                                  : `声明 SHA-256：${displayFingerprint(hook)}${fingerprintSuffix}`}
                               </Text>
                             }
                             startContent={

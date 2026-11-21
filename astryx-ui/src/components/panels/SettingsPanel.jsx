@@ -52,6 +52,8 @@ const KIND_OPTIONS = [
 
 // 强调色是传给 App runtime theme 的数据值，不是组件内联样式。
 const ACCENT_OPTIONS = [
+  // 空串是 Rust 的「跟随主题预设」语义（settings.rs:380），不是没配好。
+  { value: '', label: '跟随预设' },
   { value: '#7c8cff', label: '靛蓝' },
   { value: '#22d3ee', label: '青色' },
   { value: '#f472b6', label: '粉色' },
@@ -266,22 +268,28 @@ export default function SettingsPanel({
       showToast({ body: '到期日格式应为 YYYY-MM-DD', type: 'error' });
       return;
     }
-    onUpdateMemory(editingMemory.id, {
+    const result = onUpdateMemory(editingMemory.id, {
       kind: editDraft.kind,
       body,
       dueAt: due.value,
     });
     setEditingId(null);
-    showToast({ body: '已更新长期记忆' });
+    // 真实模式是异步提交、由 App 回调负责成功/失败 toast；mock（同步返回 undefined）才在这里报成功。
+    if (!(result instanceof Promise)) {
+      showToast({ body: '已更新长期记忆' });
+    }
   }
 
   function handleDeleteMemory(id) {
-    onDeleteMemory(id);
+    const result = onDeleteMemory(id);
     if (editingId === id) {
       setEditingId(null);
     }
     setConfirmClearMemories(false);
-    showToast({ body: '已删除长期记忆' });
+    // 同上：Promise 返回说明由 App 负责 toast，这里只在 mock 同步路径报成功。
+    if (!(result instanceof Promise)) {
+      showToast({ body: '已删除长期记忆' });
+    }
   }
 
   function handleClearMemories() {
@@ -467,7 +475,7 @@ export default function SettingsPanel({
         />
 
         <Text type="supporting" color="secondary">
-          字号和强调色即时生效；刷新页面后回到初始值。
+          {persistNote}
         </Text>
       </VStack>
     );

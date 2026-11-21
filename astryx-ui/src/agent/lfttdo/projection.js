@@ -34,10 +34,11 @@ function mapContentBlocks(blocks) {
     if (!block) return [];
     if (block.type === 'text') return [{ type: 'text', text: String(block.text ?? '') }];
     if (block.type === 'image') {
+      // mime 是裸 "png"/"jpeg"（Rust ContentBlock），data URL 要补 image/ 前缀。
       return [
         {
           type: 'image',
-          src: `data:${block.mime};base64,${block.data}`,
+          src: `data:image/${block.mime};base64,${block.data}`,
           alt: '附件图片',
         },
       ];
@@ -182,7 +183,7 @@ export function projectEvent(state, event, meta = {}) {
         .filter((image) => image?.data)
         .map((image) => ({
           type: 'image',
-          src: `data:${image.mime};base64,${image.data}`,
+          src: `data:image/${image.mime};base64,${image.data}`,
           alt: '工具输出图片',
         }));
       const updated = {

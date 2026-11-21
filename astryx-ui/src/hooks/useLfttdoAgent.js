@@ -34,7 +34,10 @@ function localBlocks(blocks) {
   return blocks.flatMap((block) => {
     if (block.type === 'text') return [{ type: 'text', text: block.text }];
     if (block.type === 'image') {
-      return [{ type: 'image', src: `data:${block.mime};base64,${block.data}`, alt: '附件图片' }];
+      // mime 是裸 "png"/"jpeg"（Rust ContentBlock），data URL 要补 image/ 前缀。
+      return [
+        { type: 'image', src: `data:image/${block.mime};base64,${block.data}`, alt: '附件图片' },
+      ];
     }
     return [];
   });

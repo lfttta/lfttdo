@@ -151,7 +151,11 @@ describe('projectEvent：工具对', () => {
     );
     const blocks = state.messages[0].blocks;
     expect(blocks[0]).toMatchObject({ status: 'complete', duration: 0 });
-    expect(blocks[1]).toEqual({ type: 'image', src: 'data:png;base64,QUJD', alt: '工具输出图片' });
+    expect(blocks[1]).toEqual({
+      type: 'image',
+      src: 'data:image/png;base64,QUJD',
+      alt: '工具输出图片',
+    });
   });
 
   it('target 的推导顺序是 command → pattern → query → url → 工具名', () => {
@@ -333,7 +337,7 @@ describe('projectEvents：历史重放', () => {
     expect(state.messages[0]).toMatchObject({ role: 'user' });
     expect(state.messages[0].blocks).toEqual([
       { type: 'text', text: '你好' },
-      { type: 'image', src: 'data:png;base64,QUJD', alt: '附件图片' },
+      { type: 'image', src: 'data:image/png;base64,QUJD', alt: '附件图片' },
     ]);
     expect(state.messages[1]).toMatchObject({ role: 'assistant', isStreaming: false });
     expect(state.messages[1].blocks).toEqual([{ type: 'text', text: '你好，需要什么？' }]);

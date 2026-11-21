@@ -4,12 +4,11 @@
  * camelCase 界面形状；不知道的字段原样保留，绝不猜默认值以外的语义。
  */
 
-/** mock 的默认强调色：Rust accent 空串 = 跟随主题预设，映射成 Astryx 原默认。 */
-const FALLBACK_ACCENT = '#7c8cff';
-
 /**
  * SettingsView → 界面 settings。
  * view 是「Settings 平铺字段 + api_key_masked + corrupt_backup」（ipc.rs:3139）。
+ * accent 原样保留：空串是 Rust 的「跟随主题预设」语义（settings.rs:380），
+ * 不能编造成具体颜色——否则任何一次设置写回都会把跟随预设永久写死成固定色。
  */
 export function settingsFromLfttdo(view) {
   const mode = view?.permission_mode;
@@ -19,7 +18,7 @@ export function settingsFromLfttdo(view) {
     persona: view?.system_prompt ?? '',
     contextBudget: view?.budget_tokens ?? 120000,
     fontSize: view?.font_size ?? 15,
-    accent: view?.accent || FALLBACK_ACCENT,
+    accent: view?.accent ?? '',
     permissionMode:
       mode === 'ask_all' ? 'ask' : mode === 'trusted' ? 'trusted' : 'rules',
     planMode: Boolean(view?.plan_mode),
@@ -121,23 +120,25 @@ export function hooksFromLfttdo(view) {
   };
 }
 
-/** 待办到期日 'YYYY-MM-DD' → 当地当天末尾的毫秒值（memory_add 的 dueAt）。 */
+/** 待办到期日 'YYYY-MM-DD' → UTC 当天末尾的毫秒值（memory_add 的 dueAt）。 */
 export function dueDateToMs(value) {
   const text = String(value ?? '').trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
-  // 无时区后缀的 ISO 串按本地时区解析：到期日以用户当天为准。
-  const ms = Date.parse(`${text}T23:59:59.999`);
+  // Rust 约定前端「按 UTC 换算后传下」（ipc.rs:2996）：带 Z 后缀解析成 UTC，
+  // 与 due_date_label（按 UTC 日）同口径，负时区机器上也不会分叉。
+  const ms = Date.parse(`${text}T23:59:59.999Z`);
   return Number.isNaN(ms) ? null : ms;
 }
 
 function datePart(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
+  // 统一按 UTC 取日期，与 dueDateToMs 往返一致。
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
 }
 
-/** MemoryView.due_at（毫秒）→ 'YYYY-MM-DD'（当地时区）。 */
+/** MemoryView.due_at（毫秒）→ 'YYYY-MM-DD'（UTC 口径，与写入侧互逆）。 */
 export function dueMsToDate(ms) {
   if (ms == null) return null;
   const date = new Date(Number(ms));
