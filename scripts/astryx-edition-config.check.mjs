@@ -4,11 +4,14 @@ import { readFileSync } from 'node:fs';
 
 const readJson = (path) => JSON.parse(readFileSync(path, 'utf8'));
 
-test('default LFTTDO edition keeps its original build settings', () => {
+test('default LFTTDO build points at the astryx-ui frontend (promoted 2026-11-21)', () => {
   const base = readJson('src-tauri/tauri.conf.json');
   assert.equal(base.productName, 'LFTTDO');
+  assert.equal(base.identifier, 'com.qwa.do');
   assert.equal(base.build.devUrl, 'http://localhost:1420');
-  assert.equal(base.build.frontendDist, '../dist');
+  assert.equal(base.build.beforeDevCommand, 'npm run dev:astryx');
+  assert.equal(base.build.beforeBuildCommand, 'npm run build:astryx');
+  assert.equal(base.build.frontendDist, '../astryx-ui/dist');
 });
 
 test('Astryx overlay is a separate edition', () => {
@@ -41,9 +44,13 @@ test('Astryx overlay keeps the default security posture', () => {
   assert.equal(overlay.app, undefined, 'overlay must not add capabilities or windows');
 });
 
-test('Astryx UI applies the edition window title at runtime', () => {
+test('default frontend keeps the Rust window title and adds no window sizing', () => {
   const main = readFileSync('astryx-ui/src/main.jsx', 'utf8');
-  assert.match(main, /setTitle\('LFTTDO Astryx'\)/);
+  assert.doesNotMatch(
+    main,
+    /setTitle\(/,
+    'after promotion the title stays the Rust-hardcoded LFTTDO',
+  );
   assert.doesNotMatch(main, /setSize\(/);
 });
 
