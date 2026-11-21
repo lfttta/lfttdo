@@ -29,5 +29,7 @@ npm --prefix astryx-ui run build
 
 - 默认 LFTTDO 与 Astryx 版共用 1420 开发端口，一次只能跑一个；构建产物、产品标识与数据目录彼此独立。
 - Astryx 版使用独立数据目录 `%APPDATA%\com.qwa.do.astryx\`。
-- 当前 P1 仍使用 mock agent；真实 IPC 适配在后续阶段接入。
+- Tauri 模式已接真实内核：文本流与会话、设置持久化、技能/MCP/Hooks/记忆面板、图片、按会话工作文件夹、导出、文件定位与 @ 文件提及均已接入。
+- 浏览器（非 Tauri）模式仍是纯 mock，仅供不启动 Tauri 调 UI。
+- API Key 凭据（qwen-do）与默认 LFTTDO 共用；在任一版本保存或清除都会同时影响两版。
 - UI 数据契约见 `docs/agent-ui-contract.md`；整体设计见仓库根目录 `docs/superpowers/specs/2026-11-15-astryx-ui-integration-design.md`。

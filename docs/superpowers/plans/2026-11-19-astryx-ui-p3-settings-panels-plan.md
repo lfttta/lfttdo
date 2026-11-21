@@ -40,20 +40,20 @@ astryx-ui/src/components/panels/SettingsPanel.jsx  + onSaveApiKey/onClearApiKey/
 
 ## Task 1: Adapter extension and mappers
 
-- [ ] Extend `client.js` with all commands listed above (`normalizeImage` passes the ArrayBuffer through).
-- [ ] Extend `mapping.js`: fix `ask_all ↔ ask`; `settingsFromMapped(raw, mapped)` (endpoint/model/persona/budget/font/accent/permission/plan/roots over raw carry-through); mappers `skillsFromLfttdo`, `mcpServersFromLfttdo` (trust `auto→allow`, status `ready→connected`, `transport: ''`), `hooksFromLfttdo` (`id: digest`, `source: scope`), `memoriesFromLfttdo` (`kind prospective→todo`, `dueAt: 'YYYY-MM-DD'|null`), `memoryKindToWire` (todo→prospective), `dueDateToMs`/`dueMsToDate`.
-- [ ] Unit tests: mappers round-trip, trust/status/kind translations, settingsFromMapped keeps carry-through fields, due-date conversions.
-- [ ] Commit: `feat: 扩展 IPC 适配层与面板数据映射`.
+- [x] Extend `client.js` with all commands listed above (`normalizeImage` passes the ArrayBuffer through).
+- [x] Extend `mapping.js`: fix `ask_all ↔ ask`; `settingsFromMapped(raw, mapped)` (endpoint/model/persona/budget/font/accent/permission/plan/roots over raw carry-through); mappers `skillsFromLfttdo`, `mcpServersFromLfttdo` (trust `auto→allow`, status `ready→connected`, `transport: ''`), `hooksFromLfttdo` (`id: digest`, `source: scope`), `memoriesFromLfttdo` (`kind prospective→todo`, `dueAt: 'YYYY-MM-DD'|null`), `memoryKindToWire` (todo→prospective), `dueDateToMs`/`dueMsToDate`.
+- [x] Unit tests: mappers round-trip, trust/status/kind translations, settingsFromMapped keeps carry-through fields, due-date conversions.
+- [x] Commit: `feat: 扩展 IPC 适配层与面板数据映射`.
 
 ## Task 2: App wiring + SettingsPanel props
 
-- [ ] `SettingsPanel`: optional `onSaveApiKey`/`onClearApiKey` (used instead of `hasApiKey` local echo), optional `memoryEditing='full'|'body'`, optional footer note prop.
-- [ ] `App`: remove the panel/export/workspace/image/mentions gates; load memories at boot and panels on open; debounced settings persist; real handlers for memory CRUD, skills toggle, MCP trust/save/reconnect, hooks trust/workspace, workspace choose/clear/reveal via `pick_folder`/`session_workspace_set`/`session_output_view`/`reveal_path`, export via `session_export`, images via `normalize_image`, `@` mentions via `session_search_files(activeId, '')` refreshed on session/workspace change.
-- [ ] Build + tests + doctor.
-- [ ] Commit: `feat: 设置持久化与真实面板数据`.
+- [x] `SettingsPanel`: optional `onSaveApiKey`/`onClearApiKey` (used instead of `hasApiKey` local echo), optional `memoryEditing='full'|'body'`, optional footer note prop.
+- [x] `App`: remove the panel/export/workspace/image/mentions gates; load memories at boot and panels on open; debounced settings persist; real handlers for memory CRUD, skills toggle, MCP trust/save/reconnect, hooks trust/workspace, workspace choose/clear/reveal via `pick_folder`/`session_workspace_set`/`session_output_view`/`reveal_path`, export via `session_export`, images via `normalize_image`, `@` mentions via `session_search_files(activeId, '')` refreshed on session/workspace change.
+- [x] Build + tests + doctor.
+- [x] Commit: `feat: 设置持久化与真实面板数据`.
 
 ## Task 3: Acceptance
 
-- [ ] `npm --prefix astryx-ui run test`, build, `doctor --built dist` 0 fail, `test:edition` 11/11, old frontend regression unchanged.
-- [ ] Tauri manual run with the local SSE fixture: settings edit survives restart (settings.json check), API key save/clear (masked feedback), memories add/edit-body/delete/clear, skills/MCP/hooks panels open with real (possibly empty) lists, image attach + send through `normalize_image`, workspace choose/clear with the real folder picker, export (native dialog), `@` file mentions after setting roots, model switch still persists.
-- [ ] Push via GitHub Git Data API and verify blob SHAs.
+- [x] `npm --prefix astryx-ui run test`, build, `doctor --built dist` 0 fail, `test:edition` 11/11, old frontend regression unchanged.
+- [x] Tauri manual run with the local SSE fixture: settings edit survives restart (settings.json check), API key save/clear (masked feedback), memories add/edit-body/delete/clear, skills/MCP/hooks panels open with real (possibly empty) lists, image attach + send through `normalize_image`, workspace choose/clear with the real folder picker, export (native dialog), `@` file mentions after setting roots, model switch still persists.
+- [x] Push via GitHub Git Data API and verify blob SHAs.
