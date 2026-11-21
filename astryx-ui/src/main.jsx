@@ -2,7 +2,6 @@ import { createRoot } from 'react-dom/client';
 import { Theme } from '@astryxdesign/core/theme';
 import { InternationalizationProvider } from '@astryxdesign/core/i18n';
 import zhCN from '@astryxdesign/core/locales/zh-CN.generated.js';
-import { getCurrentWindow } from '@tauri-apps/api/window';
 
 // 基础样式：重置 + 组件样式，必须在主题之前引入
 import '@astryxdesign/core/reset.css';
@@ -13,12 +12,8 @@ import { themes, defaultThemeSlug } from '../astryx-themes';
 
 import App from './App';
 
-// Rust 主窗口把标题硬编码为 LFTTDO，独立版本在 Tauri 内运行时改成 LFTTDO Astryx。
-// 浏览器里直接跑 `npm run dev` 时没有 __TAURI_INTERNALS__，跳过。
-// 窗口尺寸沿用 Rust 的 800×600，用户可最大化；这里不申请额外的窗口尺寸权限。
-if ('__TAURI_INTERNALS__' in window) {
-  getCurrentWindow().setTitle('LFTTDO Astryx').catch(() => {});
-}
+// 窗口标题沿用 Rust 写死的 LFTTDO（转正后这就是主应用标题）；
+// 窗口尺寸沿用 Rust 的 800×600，用户可最大化。
 
 createRoot(document.getElementById('root')).render(
   <Theme theme={themes[defaultThemeSlug]} mode="dark">

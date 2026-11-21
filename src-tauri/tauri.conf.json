@@ -4,10 +4,10 @@
   "version": "0.2.0",
   "identifier": "com.qwa.do",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run dev:astryx",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
-    "frontendDist": "../dist"
+    "beforeBuildCommand": "npm run build:astryx",
+    "frontendDist": "../astryx-ui/dist"
   },
   "app": {
     "security": {
